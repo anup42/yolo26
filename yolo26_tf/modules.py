@@ -265,7 +265,7 @@ class Detect(keras.layers.Layer):
         self.end2end_enabled = bool(end2end)
         self.max_det = 300
         self.agnostic_nms = False
-        self.dynamic = False
+        self.dynamic_grid = False
         self.xyxy = False
         self.stride = [8.0, 16.0, 32.0][: self.nl]
         self.anchors = None

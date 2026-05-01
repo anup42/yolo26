@@ -17,6 +17,12 @@ def test_model_shapes_detect_variants():
         assert y.shape[-1] == 6
 
 
+def test_detect_layer_avoids_keras_dynamic_property():
+    model = build_model("yolo26n.yaml", nc=2, imgsz=64)
+    assert not hasattr(model.detect_layer, "__dict__") or "dynamic" not in model.detect_layer.__dict__
+    assert hasattr(model.detect_layer, "dynamic_grid")
+
+
 def test_loss_is_finite():
     model = build_model("yolo26n.yaml", nc=1, imgsz=64)
     batch = {
