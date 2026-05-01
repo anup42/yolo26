@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yolo26-tf"
+version = "0.1.0"
+description = "TensorFlow/Keras port of Ultralytics YOLO26 object detection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0" }
+authors = [{ name = "YOLO26 TensorFlow Port" }]
+dependencies = [
+  "numpy>=1.23",
+  "pillow>=9.0",
+  "pyyaml>=5.3.1",
+]
+
+[project.optional-dependencies]
+tf = ["tensorflow>=2.16,<2.20"]
+dev = ["pytest>=7.0", "opencv-python-headless>=4.6"]
+convert = ["torch>=2.1", "torchvision>=0.16", "ultralytics @ git+https://github.com/ultralytics/ultralytics.git@b4cf7c4751e1d532eb5b0f5a3e9d67b9583964a7"]
+export = ["tf2onnx>=1.16", "tensorflowjs>=4.0"]
+
+[project.scripts]
+yolo26-tf = "yolo26_tf.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["yolo26_tf*"]
+
+[tool.setuptools.package-data]
+yolo26_tf = ["configs/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

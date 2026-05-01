@@ -1,0 +1,63 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+# Build/install artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Local environment files
+.env
+.env.*
+*.log
+
+# Generated datasets and examples
+datasets/
+examples/
+
+# Training, validation, benchmark, and export outputs
+runs/
+wandb/
+mlruns/
+tensorboard/
+
+# Model checkpoints and converted/exported model files
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+*.pb
+*.keras
+*.h5
+*.weights
+*.weights.h5
+saved_model/
+SavedModel/
+
+# Download archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
