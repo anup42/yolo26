@@ -40,6 +40,7 @@ YOLO26_BENCH_DATA=datasets/coco \
 YOLO26_BENCH_OUT=runs/benchmark/yolo26n_tf_coco \
 YOLO26_BENCH_BATCH=16 \
 YOLO26_BENCH_IMGSZ=640 \
+YOLO26_BENCH_DEVICE=auto \
 bash scripts/benchmark_coco_yolo26n_linux.sh
 ```
 
@@ -54,3 +55,5 @@ Notes:
 - COCO train2017 is not required for validation mAP; the script downloads val2017 and `instances_val2017.json`.
 - The TensorFlow benchmark defaults to NMS-free end-to-end YOLO26 evaluation with `conf=0.001`, `iou=0.7`, `max_det=300`, and image size 640.
 - Add `--nms` if you explicitly want an NMS compatibility run, but compare the default run against the official `mAP50-95(e2e)` target of `40.1`.
+- If TensorFlow fails with `CUDNN_STATUS_NOT_INITIALIZED`, `Could not create cudnn handle`, or `No DNN in stream executor`, rerun with `YOLO26_BENCH_DEVICE=cpu bash scripts/benchmark_coco_yolo26n_linux.sh`. The benchmark also auto-falls back to CPU in `auto` mode for this specific CUDA/cuDNN initialization failure.
+- `imgsz` is normalized to a stride multiple. For the official YOLO26n benchmark, keep `YOLO26_BENCH_IMGSZ=640`.

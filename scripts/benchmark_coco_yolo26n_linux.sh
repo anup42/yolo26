@@ -12,6 +12,7 @@
 #   YOLO26_BENCH_OUT=runs/benchmark/yolo26n_tf_coco
 #   YOLO26_BENCH_BATCH=16
 #   YOLO26_BENCH_IMGSZ=640
+#   YOLO26_BENCH_DEVICE=auto   # auto, cpu, or gpu
 
 set -euo pipefail
 
@@ -22,6 +23,7 @@ DATA_DIR="${YOLO26_BENCH_DATA:-$ROOT_DIR/datasets/coco}"
 OUT_DIR="${YOLO26_BENCH_OUT:-$ROOT_DIR/runs/benchmark/yolo26n_tf_coco}"
 BATCH="${YOLO26_BENCH_BATCH:-16}"
 IMGSZ="${YOLO26_BENCH_IMGSZ:-640}"
+DEVICE="${YOLO26_BENCH_DEVICE:-auto}"
 WEIGHTS="$OUT_DIR/yolo26n.pt"
 TF_WEIGHTS="$OUT_DIR/yolo26n_tf.weights.h5"
 
@@ -102,6 +104,7 @@ python "$ROOT_DIR/scripts/benchmark_coco_yolo26n.py" \
   --out "$OUT_DIR" \
   --imgsz "$IMGSZ" \
   --batch "$BATCH" \
+  --device "$DEVICE" \
   "$@"
 
 echo "Benchmark results: $OUT_DIR/results_yolo26n_tf_coco_val2017.json"
