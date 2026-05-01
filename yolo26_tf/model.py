@@ -106,12 +106,13 @@ class DetectionModel(keras.Model):
                 setattr(self.detect_layer, k, v)
 
     def _initialize(self, imgsz: int, ch: int):
-        dummy = tf.zeros([1, imgsz, imgsz, ch], dtype=tf.float32)
+        init_imgsz = max(64, min(int(imgsz), 256))
+        dummy = tf.zeros([1, init_imgsz, init_imgsz, ch], dtype=tf.float32)
         train_out = self(dummy, training=True)
         if self.detect_layer is not None:
             preds = train_out["one2many"] if self.end2end else train_out
             feats = preds["feats"]
-            self.stride = [float(imgsz / int(feat.shape[1])) for feat in feats]
+            self.stride = [float(init_imgsz / int(feat.shape[1])) for feat in feats]
             self.detect_layer.stride = self.stride
             self.detect_layer.bias_init()
         _ = self(dummy, training=False)

@@ -8,6 +8,12 @@
 
 set -euo pipefail
 
+export KERAS_BACKEND="${KERAS_BACKEND:-tensorflow}"
+export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
+export TF_ENABLE_ONEDNN_OPTS="${TF_ENABLE_ONEDNN_OPTS:-0}"
+export TF_FORCE_GPU_ALLOW_GROWTH="${TF_FORCE_GPU_ALLOW_GROWTH:-true}"
+export TF_XLA_FLAGS="${TF_XLA_FLAGS:---tf_xla_auto_jit=0}"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
 VENV_DIR="${YOLO26_COCO_VENV:-$ROOT_DIR/.venv-coco-train}"
@@ -65,6 +71,7 @@ python -m pip check
 
 python - <<'PY'
 from importlib.metadata import version
+import os
 
 npv = version("numpy")
 print("NumPy:", npv)
@@ -75,7 +82,9 @@ if int(npv.split(".", 1)[0]) >= 2:
     )
 
 import tensorflow as tf
+tf.config.optimizer.set_jit(False)
 print("TensorFlow:", tf.__version__)
+print("TensorFlow XLA JIT:", tf.config.optimizer.get_jit(), "TF_XLA_FLAGS=", os.environ.get("TF_XLA_FLAGS", ""))
 gpus = tf.config.list_physical_devices("GPU")
 print("GPUs:", gpus)
 if not gpus:

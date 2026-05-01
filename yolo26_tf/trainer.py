@@ -58,6 +58,7 @@ class TrainConfig:
     val_iou: float = 0.7
     max_det: int = 300
     save_period: int = -1
+    log_interval: int = 10
 
 
 DEFAULT_HYP = {
@@ -149,6 +150,11 @@ class YOLO26Trainer:
         set_seed(self.cfg.seed)
         if self.cfg.amp:
             tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        print(
+            f"Starting YOLO26 training: epochs={self.cfg.epochs}, imgsz={self.cfg.imgsz}, "
+            f"batch={self.cfg.batch}, replicas={self.replicas}, xla_jit={tf.config.optimizer.get_jit()}",
+            flush=True,
+        )
         train_ds = YOLODataset(
             self.data,
             "train",
@@ -187,6 +193,7 @@ class YOLO26Trainer:
                 train_ds.close_mosaic()
             start = time.time()
             losses = []
+            print(f"epoch {epoch + 1}/{self.cfg.epochs} starting, batches={len(train_ds)}", flush=True)
             iterator = train_ds.as_tf_dataset(prefetch=max(self.cfg.workers, 1)) if self.replicas > 1 else train_ds
             if self.replicas > 1:
                 iterator = self.strategy.experimental_distribute_dataset(iterator)
@@ -200,6 +207,13 @@ class YOLO26Trainer:
                     batch_tf = to_tensor_batch(batch_data)
                     loss_items = self._train_step(batch_tf, accumulate, lr)
                 losses.append(np.asarray(loss_items.numpy(), dtype=np.float32))
+                if i == 0 or (self.cfg.log_interval > 0 and (i + 1) % self.cfg.log_interval == 0) or (i + 1) == len(train_ds):
+                    li = losses[-1]
+                    print(
+                        f"epoch {epoch + 1}/{self.cfg.epochs} batch {i + 1}/{len(train_ds)} "
+                        f"box={li[0]:.4f} cls={li[1]:.4f} dfl={li[2]:.4f} lr={lr:.6g}",
+                        flush=True,
+                    )
             self._flush_accumulated(lr=self._current_lr())
             if self.loss_fn:
                 self.loss_fn.update()
