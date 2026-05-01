@@ -1,21 +1,20 @@
-﻿"""YOLO26 detection losses rewritten for TensorFlow eager training."""
+"""YOLO26 detection losses rewritten for TensorFlow training.
+
+The loss keeps the public Ultralytics detection behavior that matters for YOLO26:
+end-to-end one-to-many/one-to-one branches, TaskAligned assignment, CIoU box
+loss, BCE class loss, and the reg_max=1 normalized L1 distance term.
+"""
 
 from __future__ import annotations
 
-import numpy as np
-
-from .ops import bbox2dist, bbox_iou, dist2bbox, make_anchors, pairwise_iou_np, xywh2xyxy_np
+from .ops import bbox2dist, bbox_iou, dist2bbox, make_anchors
 from .tf_import import require_tf
 
 tf = require_tf()
 
 
-def _to_numpy(x):
-    return x.numpy() if hasattr(x, "numpy") else np.asarray(x)
-
-
 class TaskAlignedAssigner:
-    """Numpy/eager TaskAlignedAssigner matching the public YOLO task-aligned assignment logic."""
+    """TensorFlow TaskAlignedAssigner for YOLO detection training."""
 
     def __init__(self, topk: int = 10, num_classes: int = 80, alpha: float = 0.5, beta: float = 6.0, topk2: int | None = None):
         self.topk = int(topk)
@@ -26,75 +25,76 @@ class TaskAlignedAssigner:
         self.eps = 1e-9
 
     def __call__(self, pd_scores, pd_bboxes, anchor_points, gt_labels, gt_bboxes, mask_gt):
-        scores = _to_numpy(tf.stop_gradient(pd_scores)).astype(np.float32)
-        boxes = _to_numpy(tf.stop_gradient(pd_bboxes)).astype(np.float32)
-        anchors = _to_numpy(tf.stop_gradient(anchor_points)).astype(np.float32)
-        labels = _to_numpy(gt_labels).astype(np.int64)
-        gt = _to_numpy(gt_bboxes).astype(np.float32)
-        mask = _to_numpy(mask_gt).astype(bool)
-        bsz, anchors_n, nc = scores.shape
-        target_bboxes = np.zeros((bsz, anchors_n, 4), dtype=np.float32)
-        target_scores = np.zeros((bsz, anchors_n, nc), dtype=np.float32)
-        fg_mask = np.zeros((bsz, anchors_n), dtype=bool)
-        target_gt_idx = np.zeros((bsz, anchors_n), dtype=np.int64)
-        for b in range(bsz):
-            valid = mask[b] & (gt[b].sum(axis=-1) > 0)
-            if not np.any(valid):
-                continue
-            gtb = gt[b][valid]
-            gtl = labels[b][valid].reshape(-1)
-            n_gt = len(gtb)
-            ap = anchors[None, :, :]
-            in_gts = (
-                (ap[..., 0] > gtb[:, None, 0])
-                & (ap[..., 1] > gtb[:, None, 1])
-                & (ap[..., 0] < gtb[:, None, 2])
-                & (ap[..., 1] < gtb[:, None, 3])
-            )
-            ious = pairwise_iou_np(gtb, boxes[b]).clip(0.0)
-            cls_scores = scores[b][None, :, :].repeat(n_gt, axis=0)
-            cls_take = cls_scores[np.arange(n_gt)[:, None], np.arange(anchors_n)[None, :], gtl[:, None]]
-            metric = (cls_take**self.alpha) * (ious**self.beta) * in_gts
-            mask_pos = np.zeros_like(metric, dtype=bool)
-            k = min(self.topk, anchors_n)
-            for gi in range(n_gt):
-                if metric[gi].max() <= self.eps:
-                    continue
-                idx = np.argpartition(-metric[gi], k - 1)[:k]
-                mask_pos[gi, idx] = metric[gi, idx] > self.eps
-            if self.topk2 != self.topk:
-                refined = np.zeros_like(mask_pos)
-                k2 = min(self.topk2, anchors_n)
-                for gi in range(n_gt):
-                    vals = metric[gi] * mask_pos[gi]
-                    if vals.max() <= self.eps:
-                        continue
-                    idx = np.argpartition(-vals, k2 - 1)[:k2]
-                    refined[gi, idx] = vals[idx] > self.eps
-                mask_pos = refined
-            if not mask_pos.any():
-                continue
-            # Resolve anchors assigned to multiple GTs by highest IoU.
-            overlaps = ious * mask_pos
-            best_gt = overlaps.argmax(axis=0)
-            best_val = overlaps.max(axis=0)
-            pos = best_val > 0
-            assigned = best_gt[pos]
-            anchor_idx = np.where(pos)[0]
-            fg_mask[b, anchor_idx] = True
-            target_gt_idx[b, anchor_idx] = assigned
-            target_bboxes[b, anchor_idx] = gtb[assigned]
-            # Normalized target score as in TAL: alignment metric normalized by best GT metric/IoU.
-            for a, gi in zip(anchor_idx, assigned):
-                gi_metric = metric[gi]
-                norm = gi_metric[a] / (gi_metric.max() + self.eps) * ious[gi].max()
-                target_scores[b, a, gtl[gi]] = float(max(norm, self.eps))
-        return (
-            tf.convert_to_tensor(target_bboxes, tf.float32),
-            tf.convert_to_tensor(target_scores, tf.float32),
-            tf.convert_to_tensor(fg_mask, tf.bool),
-            tf.convert_to_tensor(target_gt_idx, tf.int64),
+        pd_scores = tf.stop_gradient(tf.cast(pd_scores, tf.float32))
+        pd_bboxes = tf.stop_gradient(tf.cast(pd_bboxes, tf.float32))
+        anchor_points = tf.stop_gradient(tf.cast(anchor_points, tf.float32))
+        gt_bboxes = tf.cast(gt_bboxes, tf.float32)
+        gt_labels = tf.cast(gt_labels, tf.int32)
+        mask_gt = tf.cast(mask_gt, tf.bool) & (tf.reduce_sum(gt_bboxes, axis=-1) > 0)
+
+        bsz = tf.shape(pd_scores)[0]
+        anchors_n = tf.shape(pd_scores)[1]
+        max_gt = tf.shape(gt_bboxes)[1]
+
+        ap = anchor_points[None, None, :, :]
+        gtb = gt_bboxes[:, :, None, :]
+        in_gts = (
+            (ap[..., 0] > gtb[..., 0])
+            & (ap[..., 1] > gtb[..., 1])
+            & (ap[..., 0] < gtb[..., 2])
+            & (ap[..., 1] < gtb[..., 3])
         )
+        in_gts = in_gts & mask_gt[:, :, None]
+
+        ious = pairwise_iou_tf(gt_bboxes, pd_bboxes)
+        labels = tf.clip_by_value(gt_labels, 0, self.num_classes - 1)
+        label_oh = tf.one_hot(labels, self.num_classes, dtype=pd_scores.dtype)
+        cls_scores = tf.reduce_sum(pd_scores[:, None, :, :] * label_oh[:, :, None, :], axis=-1)
+        metric = tf.pow(tf.maximum(cls_scores, 0.0), self.alpha) * tf.pow(tf.maximum(ious, 0.0), self.beta)
+        metric = tf.where(in_gts, metric, tf.zeros_like(metric))
+
+        mask_pos = self._topk_mask(metric, self.topk)
+        if self.topk2 != self.topk:
+            mask_pos = self._topk_mask(tf.where(mask_pos, metric, tf.zeros_like(metric)), self.topk2)
+        mask_pos_f = tf.cast(mask_pos, tf.float32)
+
+        overlaps = ious * mask_pos_f
+        best_gt_idx = tf.argmax(overlaps, axis=1, output_type=tf.int32)
+        best_overlap = tf.reduce_max(overlaps, axis=1)
+        fg_mask = best_overlap > 0
+        target_gt_idx = tf.cast(best_gt_idx, tf.int64)
+        target_bboxes = tf.gather(gt_bboxes, best_gt_idx, batch_dims=1)
+        target_labels = tf.gather(labels, best_gt_idx, batch_dims=1)
+
+        gt_selector = tf.one_hot(best_gt_idx, max_gt, dtype=tf.float32)
+        selected_metric = tf.reduce_sum(tf.transpose(metric, [0, 2, 1]) * gt_selector, axis=-1)
+        pos_metric_max = tf.reduce_max(metric * mask_pos_f, axis=-1)
+        pos_iou_max = tf.reduce_max(ious * mask_pos_f, axis=-1)
+        selected_metric_max = tf.reduce_sum(pos_metric_max[:, None, :] * gt_selector, axis=-1)
+        selected_iou_max = tf.reduce_sum(pos_iou_max[:, None, :] * gt_selector, axis=-1)
+        norm = selected_metric / (selected_metric_max + self.eps) * selected_iou_max
+        norm = tf.where(fg_mask, tf.maximum(norm, self.eps), tf.zeros_like(norm))
+        target_scores = tf.one_hot(target_labels, self.num_classes, dtype=tf.float32) * norm[..., None]
+        target_bboxes = tf.where(fg_mask[..., None], target_bboxes, tf.zeros_like(target_bboxes))
+        return target_bboxes, target_scores, fg_mask, target_gt_idx
+
+    def _topk_mask(self, metric, topk: int):
+        k = tf.minimum(tf.cast(topk, tf.int32), tf.shape(metric)[-1])
+        values, _ = tf.math.top_k(metric, k=k)
+        threshold = values[..., -1:]
+        return (metric >= tf.maximum(threshold, self.eps)) & (metric > self.eps)
+
+
+def pairwise_iou_tf(boxes1, boxes2, eps: float = 1e-7):
+    """Pairwise IoU for boxes shaped [B, N, 4] and [B, A, 4]."""
+    b1 = boxes1[:, :, None, :]
+    b2 = boxes2[:, None, :, :]
+    inter_w = tf.maximum(tf.minimum(b1[..., 2], b2[..., 2]) - tf.maximum(b1[..., 0], b2[..., 0]), 0.0)
+    inter_h = tf.maximum(tf.minimum(b1[..., 3], b2[..., 3]) - tf.maximum(b1[..., 1], b2[..., 1]), 0.0)
+    inter = inter_w * inter_h
+    area1 = tf.maximum(b1[..., 2] - b1[..., 0], 0.0) * tf.maximum(b1[..., 3] - b1[..., 1], 0.0)
+    area2 = tf.maximum(b2[..., 2] - b2[..., 0], 0.0) * tf.maximum(b2[..., 3] - b2[..., 1], 0.0)
+    return inter / (area1 + area2 - inter + eps)
 
 
 class BboxLoss:
@@ -104,8 +104,13 @@ class BboxLoss:
     def __call__(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, imgsz, stride_tensor):
         weight = tf.reduce_sum(target_scores, axis=-1)
         fg = tf.where(fg_mask)
-        if tf.shape(fg)[0] == 0:
-            return tf.constant(0.0, tf.float32), tf.constant(0.0, tf.float32)
+        return tf.cond(
+            tf.shape(fg)[0] > 0,
+            lambda: self._loss_non_empty(pred_dist, pred_bboxes, anchor_points, target_bboxes, weight, target_scores_sum, fg, imgsz, stride_tensor),
+            lambda: (tf.constant(0.0, tf.float32), tf.constant(0.0, tf.float32)),
+        )
+
+    def _loss_non_empty(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, weight, target_scores_sum, fg, imgsz, stride_tensor):
         pd = tf.gather_nd(pred_bboxes, fg)
         target_bboxes_grid = target_bboxes / stride_tensor[None, :, :]
         tb = tf.gather_nd(target_bboxes_grid, fg)
@@ -122,7 +127,7 @@ class BboxLoss:
         pdist = pdist / norm
         loss_l1 = tf.reduce_mean(tf.abs(tf.gather_nd(pdist, fg) - tf.gather_nd(target_ltrb, fg)), axis=-1, keepdims=True)
         loss_dfl = tf.reduce_sum(loss_l1 * w) / target_scores_sum
-        return loss_iou, loss_dfl
+        return tf.cast(loss_iou, tf.float32), tf.cast(loss_dfl, tf.float32)
 
 
 class DetectionLoss:
@@ -137,9 +142,11 @@ class DetectionLoss:
         self.hyp = {"box": 7.5, "cls": 0.5, "dfl": 1.5, "epochs": 100}
         if hyp:
             self.hyp.update(hyp)
+        class_weights = self.hyp.get("class_weights")
+        self.class_weights = None if class_weights is None else tf.reshape(tf.cast(class_weights, tf.float32), [1, 1, -1])
 
     def _targets_to_xyxy(self, batch, imgsz):
-        bboxes = batch["bboxes"]
+        bboxes = tf.cast(batch["bboxes"], tf.float32)
         cls = tf.cast(batch["cls"], tf.int64)
         mask = tf.cast(batch.get("mask", tf.reduce_sum(bboxes, axis=-1) > 0), tf.bool)
         scale = tf.reshape(tf.cast([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], bboxes.dtype), [1, 1, 4])
@@ -152,18 +159,21 @@ class DetectionLoss:
         return dist2bbox(pred_dist, anchor_points[None, :, :], xywh=False)
 
     def loss(self, preds: dict, batch: dict):
-        pred_dist = preds["boxes"]
-        pred_scores = preds["scores"]
+        pred_dist = tf.cast(preds["boxes"], tf.float32)
+        pred_scores = tf.cast(preds["scores"], tf.float32)
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
         imgsz = tf.cast(tf.shape(batch["img"])[1:3], pred_scores.dtype)
         pred_bboxes_grid = self.bbox_decode(anchor_points, pred_dist)
         pred_bboxes = pred_bboxes_grid * stride_tensor[None, :, :]
         gt_labels, gt_bboxes, mask_gt = self._targets_to_xyxy(batch, imgsz)
-        target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+        target_bboxes, target_scores, fg_mask, _ = self.assigner(
             tf.sigmoid(pred_scores), pred_bboxes, anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt
         )
         target_scores_sum = tf.maximum(tf.reduce_sum(target_scores), 1.0)
-        cls_loss = tf.reduce_sum(tf.nn.sigmoid_cross_entropy_with_logits(labels=target_scores, logits=pred_scores)) / target_scores_sum
+        cls_loss_raw = tf.nn.sigmoid_cross_entropy_with_logits(labels=target_scores, logits=pred_scores)
+        if self.class_weights is not None:
+            cls_loss_raw = cls_loss_raw * self.class_weights
+        cls_loss = tf.reduce_sum(cls_loss_raw) / target_scores_sum
         box_loss, dfl_loss = self.bbox_loss(
             pred_dist,
             pred_bboxes_grid,
@@ -175,9 +185,7 @@ class DetectionLoss:
             imgsz,
             stride_tensor,
         )
-        loss_items = tf.stack(
-            [box_loss * self.hyp["box"], cls_loss * self.hyp["cls"], dfl_loss * self.hyp["dfl"]]
-        )
+        loss_items = tf.stack([box_loss * self.hyp["box"], cls_loss * self.hyp["cls"], dfl_loss * self.hyp["dfl"]])
         return tf.reduce_sum(loss_items) * tf.cast(tf.shape(pred_scores)[0], tf.float32), loss_items
 
     def __call__(self, preds, batch):

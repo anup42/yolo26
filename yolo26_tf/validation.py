@@ -1,0 +1,99 @@
+"""Validation helpers for YOLO26 TensorFlow detection."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from .coco import COCO80_TO_COCO91, coco_image_id_from_path, evaluate_coco_predictions
+from .data import YOLODataset, load_data_yaml
+from .metrics import ap_per_class, targets_from_batch
+from .ops import nms_numpy, scale_boxes_np
+from .tf_import import require_tf
+
+tf = require_tf()
+
+
+def validate_detection_model(
+    model,
+    data: str | Path | dict,
+    imgsz: int = 640,
+    batch: int = 16,
+    conf: float = 0.25,
+    iou: float = 0.45,
+    max_det: int = 300,
+    rect: bool = True,
+    use_coco: bool = False,
+    save_json: bool = False,
+    project: str | Path = "runs/detect",
+    name: str = "val",
+    verbose: bool = True,
+) -> dict[str, Any]:
+    data_dict = load_data_yaml(data)
+    ds = YOLODataset(data_dict, "val", imgsz, batch, augment=False, shuffle=False, rect=rect)
+    preds_all, targets_all, coco_rows, image_ids = [], [], [], []
+    for b in ds:
+        raw = model(tf.convert_to_tensor(b["img"], tf.float32), training=False).numpy()
+        for pred, im_file, shape, ratio, pad in zip(raw, b["im_file"], b["ori_shape"], b["ratio"], b["pad"]):
+            det = prediction_to_detections(pred, conf=conf, iou=iou, max_det=max_det)
+            preds_all.append(det.astype(np.float32))
+            if use_coco:
+                image_id = coco_image_id_from_path(im_file)
+                image_ids.append(image_id)
+                coco_rows.extend(detections_to_coco_rows(det, image_id, shape, imgsz, ratio, pad))
+        targets_all.extend(targets_from_batch(b, imgsz))
+    if use_coco:
+        ann = data_dict.get("val_annotations") or data_dict.get("annotations")
+        if ann is None:
+            raise FileNotFoundError("COCO validation requested, but data YAML has no val_annotations or annotations entry.")
+        if save_json:
+            out_dir = Path(project) / name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "predictions.json").write_text(json.dumps(coco_rows), encoding="utf-8")
+        metrics = evaluate_coco_predictions(ann, coco_rows, image_ids=image_ids)
+    else:
+        metrics = ap_per_class(preds_all, targets_all, iou_thres=0.5)
+    if verbose:
+        print(metrics)
+    return metrics
+
+
+def prediction_to_detections(pred: np.ndarray, conf: float = 0.25, iou: float = 0.45, max_det: int = 300) -> np.ndarray:
+    if pred.size == 0:
+        return np.zeros((0, 6), dtype=np.float32)
+    if pred.shape[-1] == 6:
+        det = pred[pred[:, 4] >= conf]
+        if len(det) > max_det:
+            det = det[np.argsort(-det[:, 4])[:max_det]]
+        return det.astype(np.float32)
+    boxes, scores = pred[:, :4], pred[:, 4:]
+    cls = scores.argmax(axis=-1)
+    score = scores.max(axis=-1)
+    return nms_numpy(np.concatenate([boxes, score[:, None], cls[:, None]], axis=-1), conf=conf, iou=iou, max_det=max_det)
+
+
+def detections_to_coco_rows(det: np.ndarray, image_id: int, ori_shape, imgsz: int, ratio, pad) -> list[dict]:
+    if len(det) == 0:
+        return []
+    boxes = scale_boxes_np(det[:, :4], (imgsz, imgsz), ori_shape, ratio_pad=((ratio[0], ratio[1]), pad))
+    boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, ori_shape[1])
+    boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, ori_shape[0])
+    wh = boxes[:, 2:4] - boxes[:, 0:2]
+    valid = (wh[:, 0] > 0) & (wh[:, 1] > 0)
+    rows = []
+    for box, wh_i, row in zip(boxes[valid], wh[valid], det[valid]):
+        cls_idx = int(row[5])
+        if cls_idx < 0 or cls_idx >= len(COCO80_TO_COCO91):
+            continue
+        rows.append(
+            {
+                "image_id": int(image_id),
+                "category_id": int(COCO80_TO_COCO91[cls_idx]),
+                "bbox": [float(box[0]), float(box[1]), float(wh_i[0]), float(wh_i[1])],
+                "score": float(row[4]),
+            }
+        )
+    return rows

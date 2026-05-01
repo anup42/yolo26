@@ -1,10 +1,58 @@
-﻿"""Command line interface for yolo26-tf."""
+"""Command line interface for yolo26-tf."""
 
 from __future__ import annotations
 
 import argparse
 
 from .api import YOLO26
+from .data import load_data_yaml
+
+
+def add_train_args(parser):
+    parser.add_argument("--model", default="yolo26n.yaml")
+    parser.add_argument("--data", required=True)
+    parser.add_argument("--nc", type=int)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--project", default="runs/detect")
+    parser.add_argument("--name", default="train")
+    parser.add_argument("--optimizer", default="auto")
+    parser.add_argument("--lr0", type=float, default=0.01)
+    parser.add_argument("--lrf", type=float, default=0.01)
+    parser.add_argument("--momentum", type=float, default=0.937)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--warmup-epochs", type=float, default=3.0)
+    parser.add_argument("--warmup-momentum", type=float, default=0.8)
+    parser.add_argument("--warmup-bias-lr", type=float, default=0.1)
+    parser.add_argument("--patience", type=int, default=100)
+    parser.add_argument("--close-mosaic", type=int, default=10)
+    parser.add_argument("--fraction", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--gpus")
+    parser.add_argument("--cache", action="store_true")
+    parser.add_argument("--rect", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--multi-scale", action="store_true")
+    parser.add_argument("--require-gpu", action="store_true")
+    parser.add_argument("--val-coco", action="store_true")
+    parser.add_argument("--save-period", type=int, default=-1)
+    parser.add_argument("--mosaic", type=float, default=1.0)
+    parser.add_argument("--mixup", type=float, default=0.0)
+    parser.add_argument("--cutmix", type=float, default=0.0)
+    parser.add_argument("--copy-paste", type=float, default=0.0)
+    parser.add_argument("--degrees", type=float, default=0.0)
+    parser.add_argument("--translate", type=float, default=0.1)
+    parser.add_argument("--scale", type=float, default=0.5)
+    parser.add_argument("--shear", type=float, default=0.0)
+    parser.add_argument("--perspective", type=float, default=0.0)
+    parser.add_argument("--hsv-h", type=float, default=0.015)
+    parser.add_argument("--hsv-s", type=float, default=0.7)
+    parser.add_argument("--hsv-v", type=float, default=0.4)
+    parser.add_argument("--fliplr", type=float, default=0.5)
+    parser.add_argument("--flipud", type=float, default=0.0)
 
 
 def main(argv=None):
@@ -14,57 +62,131 @@ def main(argv=None):
     detect_sub = detect.add_subparsers(dest="mode")
 
     train = detect_sub.add_parser("train")
-    train.add_argument("--model", default="yolo26n.yaml")
-    train.add_argument("--data", required=True)
-    train.add_argument("--epochs", type=int, default=100)
-    train.add_argument("--imgsz", type=int, default=640)
-    train.add_argument("--batch", type=int, default=16)
-    train.add_argument("--project", default="runs/detect")
-    train.add_argument("--name", default="train")
-    train.add_argument("--optimizer", default="auto")
-    train.add_argument("--lr0", type=float, default=0.01)
-    train.add_argument("--mosaic", type=float, default=1.0)
-    train.add_argument("--mixup", type=float, default=0.0)
-    train.add_argument("--cutmix", type=float, default=0.0)
+    add_train_args(train)
 
     val = detect_sub.add_parser("val")
     val.add_argument("--model", default="yolo26n.yaml")
     val.add_argument("--weights")
     val.add_argument("--data", required=True)
+    val.add_argument("--nc", type=int)
     val.add_argument("--imgsz", type=int, default=640)
     val.add_argument("--batch", type=int, default=16)
+    val.add_argument("--conf", type=float, default=0.001)
+    val.add_argument("--iou", type=float, default=0.7)
+    val.add_argument("--max-det", type=int, default=300)
+    val.add_argument("--coco", action="store_true")
+    val.add_argument("--save-json", action="store_true")
+    val.add_argument("--project", default="runs/detect")
+    val.add_argument("--name", default="val")
 
     pred = detect_sub.add_parser("predict")
     pred.add_argument("--model", default="yolo26n.yaml")
     pred.add_argument("--weights")
+    pred.add_argument("--nc", type=int)
     pred.add_argument("--source", required=True)
     pred.add_argument("--imgsz", type=int, default=640)
     pred.add_argument("--conf", type=float, default=0.25)
+    pred.add_argument("--iou", type=float, default=0.45)
+    pred.add_argument("--max-det", type=int, default=300)
 
     exp = detect_sub.add_parser("export")
     exp.add_argument("--model", default="yolo26n.yaml")
     exp.add_argument("--weights")
+    exp.add_argument("--nc", type=int)
     exp.add_argument("--format", default="saved_model")
     exp.add_argument("--output")
     exp.add_argument("--imgsz", type=int, default=640)
+    exp.add_argument("--half", action="store_true")
+    exp.add_argument("--int8", action="store_true")
+
+    bench = detect_sub.add_parser("benchmark-coco")
+    bench.add_argument("--model", default="yolo26n.yaml")
+    bench.add_argument("--weights", default="yolo26n.pt")
+    bench.add_argument("--data", required=True)
+    bench.add_argument("--imgsz", type=int, default=640)
+    bench.add_argument("--batch", type=int, default=16)
+    bench.add_argument("--conf", type=float, default=0.001)
+    bench.add_argument("--iou", type=float, default=0.7)
+    bench.add_argument("--max-det", type=int, default=300)
+    bench.add_argument("--project", default="runs/benchmark")
+    bench.add_argument("--name", default="yolo26n_tf_coco")
 
     args = parser.parse_args(argv)
     if args.task != "detect" or args.mode is None:
         parser.print_help()
         return 2
-    y = YOLO26(args.model, imgsz=getattr(args, "imgsz", 640))
-    if getattr(args, "weights", None):
-        y.model.load_weights(args.weights)
+
     if args.mode == "train":
-        y.train(data=args.data, epochs=args.epochs, imgsz=args.imgsz, batch=args.batch, project=args.project, name=args.name, optimizer=args.optimizer, lr0=args.lr0, mosaic=args.mosaic, mixup=args.mixup, cutmix=args.cutmix)
+        nc = args.nc if args.nc is not None else load_data_yaml(args.data)["nc"]
+        y = YOLO26(args.model, nc=nc, imgsz=args.imgsz)
+        y.train(
+            data=args.data,
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            project=args.project,
+            name=args.name,
+            optimizer=args.optimizer,
+            lr0=args.lr0,
+            lrf=args.lrf,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            warmup_epochs=args.warmup_epochs,
+            warmup_momentum=args.warmup_momentum,
+            warmup_bias_lr=args.warmup_bias_lr,
+            patience=args.patience,
+            close_mosaic=args.close_mosaic,
+            fraction=args.fraction,
+            seed=args.seed,
+            workers=args.workers,
+            gpus=args.gpus,
+            cache=args.cache,
+            rect=args.rect,
+            resume=args.resume,
+            amp=args.amp,
+            multi_scale=args.multi_scale,
+            require_gpu=args.require_gpu,
+            val_coco=args.val_coco,
+            save_period=args.save_period,
+            mosaic=args.mosaic,
+            mixup=args.mixup,
+            cutmix=args.cutmix,
+            copy_paste=args.copy_paste,
+            degrees=args.degrees,
+            translate=args.translate,
+            scale=args.scale,
+            shear=args.shear,
+            perspective=args.perspective,
+            hsv_h=args.hsv_h,
+            hsv_s=args.hsv_s,
+            hsv_v=args.hsv_v,
+            fliplr=args.fliplr,
+            flipud=args.flipud,
+        )
     elif args.mode == "val":
-        y.val(args.data, imgsz=args.imgsz, batch=args.batch)
+        nc = args.nc if args.nc is not None else load_data_yaml(args.data)["nc"]
+        y = YOLO26(args.model, nc=nc, imgsz=args.imgsz)
+        if args.weights:
+            y.model.load_weights(args.weights)
+        y.val(args.data, imgsz=args.imgsz, batch=args.batch, conf=args.conf, iou=args.iou, max_det=args.max_det, coco=args.coco, save_json=args.save_json, project=args.project, name=args.name)
+    elif args.mode == "benchmark-coco":
+        model_ref = args.weights if str(args.weights).endswith(".pt") else args.model
+        y = YOLO26(model_ref, imgsz=args.imgsz)
+        if args.weights and not str(args.weights).endswith(".pt"):
+            y.model.load_weights(args.weights)
+        y.val(args.data, imgsz=args.imgsz, batch=args.batch, conf=args.conf, iou=args.iou, max_det=args.max_det, coco=True, save_json=True, project=args.project, name=args.name)
     elif args.mode == "predict":
-        results = y.predict(args.source, imgsz=args.imgsz, conf=args.conf)
+        y = YOLO26(args.model, nc=args.nc, imgsz=args.imgsz)
+        if args.weights:
+            y.model.load_weights(args.weights)
+        results = y.predict(args.source, imgsz=args.imgsz, conf=args.conf, iou=args.iou, max_det=args.max_det)
         for r in results:
             print(r["path"], len(r["boxes"]), "detections")
     elif args.mode == "export":
-        print(y.export(format=args.format, output=args.output, imgsz=args.imgsz))
+        y = YOLO26(args.model, nc=args.nc, imgsz=args.imgsz)
+        if args.weights:
+            y.model.load_weights(args.weights)
+        print(y.export(format=args.format, output=args.output, imgsz=args.imgsz, half=args.half, int8=args.int8))
     return 0
 
 

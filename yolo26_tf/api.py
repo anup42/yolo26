@@ -1,23 +1,20 @@
-﻿"""High-level Ultralytics-like API for YOLO26 TensorFlow detection."""
+"""High-level Ultralytics-like API for YOLO26 TensorFlow detection."""
 
 from __future__ import annotations
 
-import json
-import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
 
-from .data import YOLODataset, load_data_yaml
+from .data import load_data_yaml
 from .export import export_model
-from .losses import E2ELoss
-from .metrics import ap_per_class, targets_from_batch
 from .model import DetectionModel, build_model
 from .ops import letterbox, nms_numpy, scale_boxes_np
-from .optim import ModelEMA, make_optimizer
 from .tf_import import require_tf
+from .trainer import DEFAULT_HYP, TrainConfig, YOLO26Trainer
+from .validation import validate_detection_model
 
 tf = require_tf()
 
@@ -42,111 +39,83 @@ class YOLO26:
                     self.model.load_weights(str(model_path))
         self.names = getattr(self.model, "names", {i: str(i) for i in range(self.model.nc)})
 
-    def train(self, data: str | Path, epochs: int = 100, imgsz: int | None = None, batch: int = 16, project: str | Path = "runs/detect", name: str = "train", **kwargs) -> dict:
+    def train(
+        self,
+        data: str | Path,
+        epochs: int = 100,
+        imgsz: int | None = None,
+        batch: int = 16,
+        project: str | Path = "runs/detect",
+        name: str = "train",
+        **kwargs,
+    ) -> dict:
         imgsz = int(imgsz or self.imgsz)
         data_dict = load_data_yaml(data)
+        if getattr(self.model, "nc", None) != data_dict["nc"] and not isinstance(self.model_ref, DetectionModel):
+            model_path = Path(self.model_ref)
+            if model_path.suffix == ".pt":
+                from .converter import convert_pt_to_tf
+
+                self.model = convert_pt_to_tf(model_path, imgsz=imgsz, nc=data_dict["nc"])
+            else:
+                self.model = build_model(str(self.model_ref), nc=data_dict["nc"], imgsz=imgsz)
         self.model.names = data_dict["names"]
         self.model.nc = data_dict["nc"]
-        hyp = {
+        hyp = dict(DEFAULT_HYP)
+        for key in list(hyp):
+            if key in kwargs:
+                hyp[key] = kwargs[key]
+        for key in ("box", "cls", "dfl", "class_weights"):
+            if key in kwargs:
+                hyp[key] = kwargs[key]
+        cfg_keys = {f.name for f in TrainConfig.__dataclass_fields__.values()}
+        cfg_values: dict[str, Any] = {
             "epochs": epochs,
-            "box": kwargs.get("box", 7.5),
-            "cls": kwargs.get("cls", 0.5),
-            "dfl": kwargs.get("dfl", 1.5),
-            "hsv_h": kwargs.get("hsv_h", 0.015),
-            "hsv_s": kwargs.get("hsv_s", 0.7),
-            "hsv_v": kwargs.get("hsv_v", 0.4),
-            "fliplr": kwargs.get("fliplr", 0.5),
-            "flipud": kwargs.get("flipud", 0.0),
-            "mosaic": kwargs.get("mosaic", 1.0),
-            "mixup": kwargs.get("mixup", 0.0),
-            "cutmix": kwargs.get("cutmix", 0.0),
-            "copy_paste": kwargs.get("copy_paste", 0.0),
-            "degrees": kwargs.get("degrees", 0.0),
-            "translate": kwargs.get("translate", 0.1),
-            "scale": kwargs.get("scale", 0.5),
-            "shear": kwargs.get("shear", 0.0),
-            "perspective": kwargs.get("perspective", 0.0),
-            "bgr": kwargs.get("bgr", 0.0),
+            "imgsz": imgsz,
+            "batch": batch,
+            "project": project,
+            "name": name,
         }
-        train_ds = YOLODataset(data_dict, "train", imgsz, batch, augment=True, hyp=hyp, shuffle=True)
-        val_ds = YOLODataset(data_dict, "val", imgsz, batch, augment=False, hyp=hyp, shuffle=False) if data_dict.get("val") else None
-        criterion = E2ELoss(self.model, hyp=hyp) if self.model.end2end else None
-        iterations = len(train_ds) * epochs
-        optimizer = make_optimizer(
-            kwargs.get("optimizer", "auto"),
-            lr=kwargs.get("lr0", 0.01),
-            momentum=kwargs.get("momentum", 0.937),
-            weight_decay=kwargs.get("weight_decay", 5e-4),
-            iterations=iterations,
-        )
-        ema = ModelEMA(self.model) if kwargs.get("ema", True) else None
-        save_dir = Path(project) / name
-        weights_dir = save_dir / "weights"
-        weights_dir.mkdir(parents=True, exist_ok=True)
-        history = []
-        best_fitness = -1.0
-        close_mosaic = int(kwargs.get("close_mosaic", 10))
-        for epoch in range(epochs):
-            if close_mosaic and epoch == max(epochs - close_mosaic, 0):
-                train_ds.close_mosaic()
-            losses = []
-            start = time.time()
-            for batch_data in train_ds:
-                batch_tf = {k: tf.convert_to_tensor(v) if k in {"img", "bboxes", "cls", "mask"} else v for k, v in batch_data.items()}
-                with tf.GradientTape() as tape:
-                    preds = self.model(batch_tf["img"], training=True)
-                    loss, loss_items = criterion(preds, batch_tf)
-                    if not tf.reduce_all(tf.math.is_finite(loss)):
-                        raise FloatingPointError("Non-finite YOLO26 loss encountered")
-                grads = tape.gradient(loss, self.model.trainable_variables)
-                grads, _ = tf.clip_by_global_norm(grads, kwargs.get("clip_grad", 10.0))
-                optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-                if ema:
-                    ema.update(self.model)
-                losses.append(loss_items.numpy())
-            criterion.update()
-            train_loss = np.mean(losses, axis=0).tolist() if losses else [0.0, 0.0, 0.0]
-            metrics = self.val(data_dict, imgsz=imgsz, batch=batch, use_ema=ema, verbose=False) if val_ds else {"fitness": -float(sum(train_loss))}
-            fitness = float(metrics.get("fitness", 0.0))
-            last = weights_dir / "last.weights.h5"
-            self.model.save_weights(str(last))
-            if fitness >= best_fitness:
-                best_fitness = fitness
-                self.model.save_weights(str(weights_dir / "best.weights.h5"))
-            row = {"epoch": epoch + 1, "box_loss": train_loss[0], "cls_loss": train_loss[1], "dfl_loss": train_loss[2], **metrics, "time": time.time() - start}
-            history.append(row)
-            (save_dir / "results.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-            print(
-                f"epoch {epoch + 1}/{epochs} box={train_loss[0]:.4f} cls={train_loss[1]:.4f} dfl={train_loss[2]:.4f} fitness={fitness:.4f}"
-            )
-            train_ds.on_epoch_end()
-        return {"save_dir": str(save_dir), "best": str(weights_dir / "best.weights.h5"), "last": str(weights_dir / "last.weights.h5"), "history": history}
+        for key in cfg_keys:
+            if key in kwargs:
+                cfg_values[key] = kwargs[key]
+        trainer = YOLO26Trainer(self.model, data_dict, TrainConfig(**cfg_values), hyp=hyp)
+        result = trainer.train()
+        self.model = trainer.model
+        self.names = getattr(self.model, "names", self.names)
+        return result
 
-    def val(self, data: str | Path | dict, imgsz: int | None = None, batch: int = 16, conf: float = 0.25, iou: float = 0.45, use_ema: ModelEMA | None = None, verbose: bool = True) -> dict:
+    def val(
+        self,
+        data: str | Path | dict,
+        imgsz: int | None = None,
+        batch: int = 16,
+        conf: float = 0.25,
+        iou: float = 0.45,
+        max_det: int = 300,
+        coco: bool = False,
+        save_json: bool = False,
+        project: str | Path = "runs/detect",
+        name: str = "val",
+        verbose: bool = True,
+        **kwargs,
+    ) -> dict:
         imgsz = int(imgsz or self.imgsz)
-        data_dict = load_data_yaml(data) if not isinstance(data, dict) else data
-        ds = YOLODataset(data_dict, "val", imgsz, batch, augment=False, shuffle=False)
-        if use_ema:
-            use_ema.apply_to(self.model)
-        preds_all, targets_all = [], []
-        for b in ds:
-            raw = self.model(tf.convert_to_tensor(b["img"], tf.float32), training=False).numpy()
-            for pred in raw:
-                if pred.shape[-1] == 6:
-                    det = pred[pred[:, 4] >= conf]
-                else:
-                    boxes, scores = pred[:, :4], pred[:, 4:]
-                    cls = scores.argmax(axis=-1)
-                    score = scores.max(axis=-1)
-                    det = nms_numpy(np.concatenate([boxes, score[:, None], cls[:, None]], axis=-1), conf, iou)
-                preds_all.append(det.astype(np.float32))
-            targets_all.extend(targets_from_batch(b, imgsz))
-        if use_ema:
-            use_ema.restore(self.model)
-        metrics = ap_per_class(preds_all, targets_all, iou_thres=0.5)
-        if verbose:
-            print(metrics)
-        return metrics
+        return validate_detection_model(
+            self.model,
+            data,
+            imgsz=imgsz,
+            batch=batch,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            rect=kwargs.get("rect", True),
+            use_coco=coco,
+            save_json=save_json,
+            project=project,
+            name=name,
+            verbose=verbose,
+        )
 
     def predict(self, source: str | Path | np.ndarray, imgsz: int | None = None, conf: float = 0.25, iou: float = 0.45, max_det: int = 300) -> list[dict]:
         imgsz = int(imgsz or self.imgsz)
@@ -158,6 +127,8 @@ class YOLO26:
             raw = self.model(tf.convert_to_tensor(x), training=False).numpy()[0]
             if raw.shape[-1] == 6:
                 det = raw[raw[:, 4] >= conf]
+                if len(det) > max_det:
+                    det = det[np.argsort(-det[:, 4])[:max_det]]
             else:
                 boxes, scores = raw[:, :4], raw[:, 4:]
                 cls = scores.argmax(axis=-1)
@@ -181,4 +152,3 @@ class YOLO26:
         else:
             files = [p]
         return [str(x) for x in files], [np.asarray(Image.open(x).convert("RGB")) for x in files]
-

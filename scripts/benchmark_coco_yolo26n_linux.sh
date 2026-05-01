@@ -13,6 +13,7 @@
 #   YOLO26_BENCH_BATCH=16
 #   YOLO26_BENCH_IMGSZ=640
 #   YOLO26_BENCH_TENSORFLOW='tensorflow[and-cuda]==2.15.1'
+#   YOLO26_BENCH_NUMPY='numpy>=1.23.5,<2.0'
 
 set -euo pipefail
 
@@ -24,6 +25,7 @@ OUT_DIR="${YOLO26_BENCH_OUT:-$ROOT_DIR/runs/benchmark/yolo26n_tf_coco}"
 BATCH="${YOLO26_BENCH_BATCH:-16}"
 IMGSZ="${YOLO26_BENCH_IMGSZ:-640}"
 TENSORFLOW_PACKAGE="${YOLO26_BENCH_TENSORFLOW:-tensorflow[and-cuda]==2.15.1}"
+NUMPY_PACKAGE="${YOLO26_BENCH_NUMPY:-numpy>=1.23.5,<2.0}"
 WEIGHTS="$OUT_DIR/yolo26n.pt"
 TF_WEIGHTS="$OUT_DIR/yolo26n_tf.weights.h5"
 
@@ -61,8 +63,23 @@ echo "Creating/updating virtualenv: $VENV_DIR"
 # shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip setuptools wheel
-python -m pip install "$TENSORFLOW_PACKAGE"
-python -m pip install -e "$ROOT_DIR[convert]" "pycocotools>=2.0.7" "tqdm>=4.66"
+python -m pip install "$NUMPY_PACKAGE" "$TENSORFLOW_PACKAGE"
+python -m pip install -e "$ROOT_DIR[convert]" "pycocotools>=2.0.7" "tqdm>=4.66" "$NUMPY_PACKAGE"
+python -m pip install --force-reinstall "$NUMPY_PACKAGE"
+python -m pip check
+
+echo "Verifying NumPy/TensorFlow ABI compatibility"
+python - <<'PY'
+from importlib.metadata import version
+
+npv = version("numpy")
+print("NumPy:", npv)
+if int(npv.split(".", 1)[0]) >= 2:
+    raise SystemExit(
+        f"NumPy {npv} is incompatible with TensorFlow 2.15.x. "
+        "The runner pins numpy<2; remove the venv and rerun if this persists."
+    )
+PY
 
 echo "Verifying TensorFlow GPU runtime"
 python - <<'PY'

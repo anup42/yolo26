@@ -40,6 +40,7 @@ YOLO26_BENCH_DATA=datasets/coco \
 YOLO26_BENCH_OUT=runs/benchmark/yolo26n_tf_coco \
 YOLO26_BENCH_BATCH=16 \
 YOLO26_BENCH_IMGSZ=640 \
+YOLO26_BENCH_NUMPY='numpy>=1.23.5,<2.0' \
 YOLO26_BENCH_TENSORFLOW='tensorflow[and-cuda]==2.15.1' \
 bash scripts/benchmark_coco_yolo26n_linux.sh
 ```
@@ -57,4 +58,50 @@ Notes:
 - Add `--nms` if you explicitly want an NMS compatibility run, but compare the default run against the official `mAP50-95(e2e)` target of `40.1`.
 - The Linux benchmark is GPU-only and does not fall back to CPU. It verifies TensorFlow GPU visibility and runs a GPU `Conv2D` sanity check before COCO evaluation.
 - For NVIDIA driver/CUDA `535.183 / 12.2`, use Python 3.10 or 3.11 and keep the default `YOLO26_BENCH_TENSORFLOW='tensorflow[and-cuda]==2.15.1'`, because TensorFlow 2.15 uses CUDA 12.2. Newer TensorFlow versions may require a newer NVIDIA driver/CUDA runtime.
+- TensorFlow 2.15.x requires NumPy 1.x. The runner pins `YOLO26_BENCH_NUMPY='numpy>=1.23.5,<2.0'`, runs `pip check`, and fails before TensorFlow import if NumPy 2.x is present.
 - `imgsz` is normalized to a stride multiple. For the official YOLO26n benchmark, keep `YOLO26_BENCH_IMGSZ=640`.
+
+## COCO Scratch Training
+
+The TensorFlow training stack now includes the YOLO26n detection pieces needed for real scratch COCO runs: YOLO/COCO dataset loading, label verification/cache metadata, mosaic/random-perspective/mixup/cutmix/HSV/flips, close-mosaic, multi-scale training, EMA, warmup/cosine LR, gradient clipping/accumulation, AMP, checkpoint resume, COCOeval validation, and TFLite export/reload verification.
+
+Use the Linux GPU-only runner:
+
+```bash
+bash scripts/train_coco_yolo26n_linux.sh
+```
+
+The default profile is a small COCO subset smoke run so the pipeline can be checked quickly:
+
+```bash
+YOLO26_COCO_PROFILE=small \
+YOLO26_COCO_SUBSET=100 \
+YOLO26_COCO_VAL_SUBSET=100 \
+YOLO26_COCO_EPOCHS_SMALL=2 \
+bash scripts/train_coco_yolo26n_linux.sh
+```
+
+For a full scratch COCO training run:
+
+```bash
+YOLO26_COCO_PROFILE=full \
+YOLO26_COCO_EPOCHS_FULL=300 \
+YOLO26_COCO_BATCH=16 \
+YOLO26_COCO_IMGSZ=640 \
+YOLO26_COCO_NUMPY='numpy>=1.23.5,<2.0' \
+bash scripts/train_coco_yolo26n_linux.sh
+```
+
+The script:
+
+- creates a fresh virtualenv;
+- installs `tensorflow[and-cuda]==2.15.1` by default for CUDA 12.2-class Linux systems;
+- pins NumPy to `<2.0`, runs `pip check`, and fails early if a stale/broken venv still has NumPy 2.x;
+- fails early if TensorFlow cannot see/use GPUs;
+- downloads COCO `train2017`, `val2017`, and annotations;
+- converts `instances_train2017.json` and `instances_val2017.json` into YOLO labels;
+- trains scratch `yolo26n.yaml` with `yolo26-tf detect train`;
+- validates with pycocotools COCOeval;
+- exports `best.weights.h5` to TFLite and reloads the TFLite model for inference.
+
+Important: the code path is now COCO-capable, but the repository does not claim the official 40.1 e2e mAP until a complete full COCO scratch training run has actually been executed and recorded. Use converted-checkpoint validation for direct checkpoint parity, and use the full profile above for scratch reproduction experiments.

@@ -81,6 +81,9 @@ class C2f(keras.layers.Layer):
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
         self.m = [Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n)]
 
+    def build(self, input_shape):
+        self.built = True
+
     def call(self, x, training=None):
         y = list(tf.split(self.cv1(x, training=training), 2, axis=-1))
         for m in self.m:
@@ -98,6 +101,9 @@ class C3(keras.layers.Layer):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)
         self.m = [Bottleneck(c_, c_, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n)]
+
+    def build(self, input_shape):
+        self.built = True
 
     def call(self, x, training=None):
         y1 = self.cv1(x, training=training)
@@ -193,6 +199,9 @@ class C2PSA(keras.layers.Layer):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
         self.m = [PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)) for _ in range(n)]
+
+    def build(self, input_shape):
+        self.built = True
 
     def call(self, x, training=None):
         a, b = tf.split(self.cv1(x, training=training), [self.c, self.c], axis=-1)
