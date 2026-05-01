@@ -12,7 +12,7 @@
 #   YOLO26_BENCH_OUT=runs/benchmark/yolo26n_tf_coco
 #   YOLO26_BENCH_BATCH=16
 #   YOLO26_BENCH_IMGSZ=640
-#   YOLO26_BENCH_DEVICE=auto   # auto, cpu, or gpu
+#   YOLO26_BENCH_TENSORFLOW='tensorflow[and-cuda]==2.15.1'
 
 set -euo pipefail
 
@@ -23,7 +23,7 @@ DATA_DIR="${YOLO26_BENCH_DATA:-$ROOT_DIR/datasets/coco}"
 OUT_DIR="${YOLO26_BENCH_OUT:-$ROOT_DIR/runs/benchmark/yolo26n_tf_coco}"
 BATCH="${YOLO26_BENCH_BATCH:-16}"
 IMGSZ="${YOLO26_BENCH_IMGSZ:-640}"
-DEVICE="${YOLO26_BENCH_DEVICE:-auto}"
+TENSORFLOW_PACKAGE="${YOLO26_BENCH_TENSORFLOW:-tensorflow[and-cuda]==2.15.1}"
 WEIGHTS="$OUT_DIR/yolo26n.pt"
 TF_WEIGHTS="$OUT_DIR/yolo26n_tf.weights.h5"
 
@@ -61,7 +61,29 @@ echo "Creating/updating virtualenv: $VENV_DIR"
 # shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e "$ROOT_DIR[tf,convert]" "pycocotools>=2.0.7" "tqdm>=4.66"
+python -m pip install "$TENSORFLOW_PACKAGE"
+python -m pip install -e "$ROOT_DIR[convert]" "pycocotools>=2.0.7" "tqdm>=4.66"
+
+echo "Verifying TensorFlow GPU runtime"
+python - <<'PY'
+import tensorflow as tf
+
+print("TensorFlow:", tf.__version__)
+gpus = tf.config.list_physical_devices("GPU")
+print("GPUs:", gpus)
+if not gpus:
+    raise SystemExit("No TensorFlow GPU detected. This benchmark is GPU-only.")
+for gpu in gpus:
+    try:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError:
+        pass
+with tf.device("/GPU:0"):
+    layer = tf.keras.layers.Conv2D(8, 3, padding="same")
+    y = layer(tf.zeros([1, 64, 64, 3], tf.float32))
+    _ = float(tf.reduce_sum(y).numpy())
+print("GPU Conv2D sanity check: ok")
+PY
 
 mkdir -p "$DATA_DIR" "$OUT_DIR"
 
@@ -104,7 +126,6 @@ python "$ROOT_DIR/scripts/benchmark_coco_yolo26n.py" \
   --out "$OUT_DIR" \
   --imgsz "$IMGSZ" \
   --batch "$BATCH" \
-  --device "$DEVICE" \
   "$@"
 
 echo "Benchmark results: $OUT_DIR/results_yolo26n_tf_coco_val2017.json"

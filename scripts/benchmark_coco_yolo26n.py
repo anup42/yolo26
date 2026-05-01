@@ -113,43 +113,48 @@ def load_coco_api():
 
 
 def configure_tensorflow_runtime(args: argparse.Namespace):
-    """Configure TensorFlow before importing yolo26_tf modules.
+    """Configure and verify TensorFlow GPU runtime before importing yolo26_tf modules.
 
     TensorFlow initializes CUDA visibility at import time.  This must happen
     before importing any yolo26_tf module because those modules lazily import
     TensorFlow at module import.
     """
-    force_cpu = args.device == "cpu" or os.environ.get("YOLO26_TF_FORCE_CPU") == "1"
-    if force_cpu:
-        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", str(args.tf_log_level))
 
     import tensorflow as tf  # type: ignore
 
-    if force_cpu:
-        try:
-            tf.config.set_visible_devices([], "GPU")
-        except RuntimeError:
-            # TensorFlow may already be initialized if the caller imported it.
-            pass
-        print("TensorFlow device mode: CPU (GPU disabled)", flush=True)
-        return tf
-
     gpus = tf.config.list_physical_devices("GPU")
-    if args.device == "gpu" and not gpus:
-        raise RuntimeError("Requested --device gpu, but TensorFlow found no visible GPUs.")
+    if not gpus:
+        raise RuntimeError(
+            "TensorFlow found no visible GPUs. This benchmark is GPU-only; check NVIDIA driver, CUDA visibility, "
+            "and that the venv installed `tensorflow[and-cuda]`."
+        )
     if gpus and args.gpu_memory_growth:
         for gpu in gpus:
             try:
                 tf.config.experimental.set_memory_growth(gpu, True)
             except RuntimeError:
                 pass
-        print(f"TensorFlow device mode: GPU auto, memory_growth=True, gpus={len(gpus)}", flush=True)
-    elif gpus:
-        print(f"TensorFlow device mode: GPU auto, memory_growth=False, gpus={len(gpus)}", flush=True)
+        print(f"TensorFlow GPU mode: memory_growth=True, gpus={len(gpus)}", flush=True)
     else:
-        print("TensorFlow device mode: CPU (no visible GPU)", flush=True)
+        print(f"TensorFlow GPU mode: memory_growth=False, gpus={len(gpus)}", flush=True)
+    verify_gpu_conv2d(tf)
     return tf
+
+
+def verify_gpu_conv2d(tf):
+    """Fail early with a clear message if CUDA/cuDNN cannot execute Conv2D."""
+    try:
+        with tf.device("/GPU:0"):
+            layer = tf.keras.layers.Conv2D(8, 3, padding="same")
+            y = layer(tf.zeros([1, 64, 64, 3], tf.float32))
+            _ = float(tf.reduce_sum(y).numpy())
+    except Exception as exc:
+        raise RuntimeError(
+            "TensorFlow sees a GPU, but GPU Conv2D failed. For the shown NVIDIA driver/CUDA 535.183/12.2 setup, "
+            "use the Linux benchmark runner default `tensorflow[and-cuda]==2.15.1` with Python 3.10 or 3.11, "
+            "or update the NVIDIA driver to match a newer TensorFlow CUDA build."
+        ) from exc
 
 
 def normalize_imgsz(imgsz: int, stride: int = 32) -> int:
@@ -159,12 +164,6 @@ def normalize_imgsz(imgsz: int, stride: int = 32) -> int:
     adjusted = int(math.ceil(imgsz / stride) * stride)
     print(f"WARNING: imgsz={imgsz} is not divisible by stride={stride}; using imgsz={adjusted}.", flush=True)
     return adjusted
-
-
-def is_gpu_dnn_error(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    needles = ("cudnn_status_not_initialized", "no dnn in stream executor", "could not create cudnn handle")
-    return any(x in text for x in needles)
 
 
 def load_tf_model(weights: Path, tf_weights: Path, imgsz: int, max_det: int, verify_conversion: bool):
@@ -336,10 +335,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--nms", action="store_true", help="Apply NMS to e2e predictions. Default is NMS-free YOLO26 e2e evaluation.")
     parser.add_argument("--verify-conversion", action="store_true", help="Run one random PyTorch-vs-TF parity check during conversion.")
-    parser.add_argument("--device", choices=("auto", "cpu", "gpu"), default="auto", help="TensorFlow device mode. Use cpu to avoid CUDA/cuDNN driver mismatches.")
     parser.add_argument("--gpu-memory-growth", dest="gpu_memory_growth", action="store_true", default=True, help="Enable TensorFlow GPU memory growth before model creation.")
     parser.add_argument("--no-gpu-memory-growth", dest="gpu_memory_growth", action="store_false", help="Disable TensorFlow GPU memory growth.")
-    parser.add_argument("--no-cpu-fallback", dest="cpu_fallback", action="store_false", default=True, help="Disable automatic CPU re-exec on CUDA/cuDNN initialization errors.")
     parser.add_argument("--tf-log-level", type=int, default=2, choices=(0, 1, 2, 3), help="TensorFlow C++ log level.")
     return parser.parse_args()
 
@@ -349,16 +346,5 @@ if __name__ == "__main__":
     try:
         run(parsed)
     except Exception as exc:
-        if parsed.cpu_fallback and parsed.device == "auto" and os.environ.get("YOLO26_TF_FORCE_CPU") != "1" and is_gpu_dnn_error(exc):
-            print(
-                "GPU/cuDNN initialization failed; re-running benchmark with CUDA_VISIBLE_DEVICES=-1. "
-                "Use --device cpu to select this explicitly or --no-cpu-fallback to fail instead.",
-                file=sys.stderr,
-                flush=True,
-            )
-            env = os.environ.copy()
-            env["YOLO26_TF_FORCE_CPU"] = "1"
-            env["CUDA_VISIBLE_DEVICES"] = "-1"
-            os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
         print(f"benchmark failed: {exc}", file=sys.stderr)
         raise
