@@ -49,7 +49,7 @@ class TrainConfig:
     fraction: float = 1.0
     cache: bool | str = False
     rect: bool = False
-    workers: int = 2
+    workers: int = 8
     gpus: str | None = None
     require_gpu: bool = False
     clip_grad: float = 10.0
@@ -101,6 +101,8 @@ class YOLO26Trainer:
         self.last = self.weights_dir / "last.weights.h5"
         self.best = self.weights_dir / "best.weights.h5"
         self.state_file = self.weights_dir / "trainer_state.json"
+        self.optimizer_state = self.weights_dir / "optimizer_state.npz"
+        self.ema_state = self.weights_dir / "ema_state.npz"
         self.best_fitness = -float("inf")
         self.start_epoch = 0
         self.history: list[dict[str, Any]] = []
@@ -112,6 +114,7 @@ class YOLO26Trainer:
         self.accum_grads = None
         self.accum_counter = 0
         self.total_iterations = 1
+        self.bias_lr = self.cfg.lr0
 
     def _make_strategy(self):
         gpus = tf.config.list_physical_devices("GPU")
@@ -170,7 +173,7 @@ class YOLO26Trainer:
             drop_last=self.replicas > 1,
         )
         if self.cfg.resume:
-            self._load_resume()
+            self._load_resume_weights()
         iterations = max(len(train_ds) * self.cfg.epochs, 1)
         self.total_iterations = iterations
         with self.strategy.scope():
@@ -195,6 +198,9 @@ class YOLO26Trainer:
             self.loss_fn = E2ELoss(self.model, hyp=self.hyp)
             self.ema = ModelEMA(self.model) if self.cfg.ema else None
             self.accum_grads = [tf.Variable(tf.zeros_like(v), trainable=False) for v in self.model.trainable_variables]
+            self._build_optimizer_slots()
+            if self.cfg.resume:
+                self._load_resume_training_state()
         nw = max(round(self.cfg.warmup_epochs * len(train_ds)), 100 if self.cfg.warmup_epochs > 0 else 0)
         accumulate = self.cfg.accumulate or max(round(self.cfg.nbs / max(self.cfg.batch, 1)), 1)
         patience_count = 0
@@ -281,6 +287,9 @@ class YOLO26Trainer:
 
     def _apply_accumulated(self, lr: float):
         grads = [g.read_value() for g in self.accum_grads]
+        if lr > 0 and self.bias_lr != lr:
+            bias_scale = float(self.bias_lr / lr)
+            grads = [g * bias_scale if is_bias_variable(v) else g for g, v in zip(grads, self.model.trainable_variables)]
         grads, _ = tf.clip_by_global_norm(grads, self.cfg.clip_grad)
         apply_decoupled_weight_decay(self.model.trainable_variables, lr, self.cfg.weight_decay)
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
@@ -300,12 +309,14 @@ class YOLO26Trainer:
         else:
             lf = max(1.0 - progress, 0.0) * (1.0 - self.cfg.lrf) + self.cfg.lrf
         lr = self.cfg.lr0 * lf
+        bias_lr = lr
         momentum = self.cfg.momentum
         if nw and ni <= nw:
-            # TensorFlow optimizer groups are approximated, so do not apply the
-            # PyTorch bias-only warmup LR to every variable.
-            lr = np.interp(ni, [0, nw], [0.0, lr]).item()
+            target_lr = lr
+            lr = np.interp(ni, [0, nw], [0.0, target_lr]).item()
+            bias_lr = np.interp(ni, [0, nw], [self.cfg.warmup_bias_lr, target_lr]).item()
             momentum = np.interp(ni, [0, nw], [self.cfg.warmup_momentum, self.cfg.momentum]).item()
+        self.bias_lr = float(bias_lr)
         set_optimizer_attr(self.optimizer, "learning_rate", lr)
         set_optimizer_attr(self.optimizer, "momentum", momentum)
         return float(lr)
@@ -349,8 +360,10 @@ class YOLO26Trainer:
             self.model.save_weights(str(self.weights_dir / f"epoch{epoch + 1}.weights.h5"))
         state = {"epoch": epoch + 1, "best_fitness": self.best_fitness, "fitness": fitness, "config": asdict(self.cfg)}
         self.state_file.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+        self._save_optimizer_state()
+        self._save_ema_state()
 
-    def _load_resume(self):
+    def _load_resume_weights(self):
         if self.last.exists():
             self.model.load_weights(str(self.last))
         if self.state_file.exists():
@@ -360,6 +373,79 @@ class YOLO26Trainer:
             history_file = self.save_dir / "results.json"
             if history_file.exists():
                 self.history = json.loads(history_file.read_text(encoding="utf-8"))
+
+    def _load_resume_training_state(self):
+        self._load_optimizer_state()
+        self._load_ema_state()
+
+    def _build_optimizer_slots(self):
+        opt = inner_optimizer(self.optimizer)
+        if hasattr(opt, "build"):
+            try:
+                opt.build(self.model.trainable_variables)
+            except Exception:
+                pass
+
+    def _optimizer_variables(self):
+        opt = inner_optimizer(self.optimizer)
+        vars_attr = getattr(opt, "variables", [])
+        return list(vars_attr() if callable(vars_attr) else vars_attr)
+
+    def _save_optimizer_state(self):
+        opt = inner_optimizer(self.optimizer)
+        try:
+            if hasattr(opt, "state_dict"):
+                state = opt.state_dict()
+                np.savez_compressed(self.optimizer_state, **{k.replace("/", "__slash__"): v for k, v in state.items()})
+                return
+            variables = self._optimizer_variables()
+            if variables:
+                np.savez_compressed(self.optimizer_state, **{f"v{i}": v.numpy() for i, v in enumerate(variables)})
+        except Exception:
+            pass
+
+    def _load_optimizer_state(self):
+        if not self.optimizer_state.exists():
+            return
+        opt = inner_optimizer(self.optimizer)
+        try:
+            data = np.load(self.optimizer_state, allow_pickle=False)
+            if hasattr(opt, "load_state_dict"):
+                state = {k.replace("__slash__", "/"): data[k] for k in data.files}
+                opt.load_state_dict(state)
+                return
+            variables = self._optimizer_variables()
+            for i, v in enumerate(variables):
+                key = f"v{i}"
+                if key in data and tuple(v.shape) == tuple(data[key].shape):
+                    v.assign(data[key])
+        except Exception:
+            pass
+
+    def _save_ema_state(self):
+        if not self.ema:
+            return
+        try:
+            state = self.ema.state_dict()
+            payload = {f"shadow{i}": v for i, v in enumerate(state["shadow"])}
+            payload["updates"] = np.asarray(state["updates"], dtype=np.int64)
+            np.savez_compressed(self.ema_state, **payload)
+        except Exception:
+            pass
+
+    def _load_ema_state(self):
+        if not self.ema or not self.ema_state.exists():
+            return
+        try:
+            data = np.load(self.ema_state, allow_pickle=False)
+            state = {"updates": int(data["updates"]) if "updates" in data else 0, "shadow": []}
+            for i in range(len(self.ema.shadow)):
+                key = f"shadow{i}"
+                if key in data:
+                    state["shadow"].append(data[key])
+            self.ema.load_state_dict(state)
+        except Exception:
+            pass
 
 
 def to_tensor_batch(batch: dict) -> dict:
@@ -440,3 +526,8 @@ def apply_decoupled_weight_decay(variables, lr: float, weight_decay: float):
         if len(v.shape) <= 1 or "bias" in name or "batch_normalization" in name or "bn" in name:
             continue
         v.assign_sub(tf.cast(lr * weight_decay, v.dtype) * v)
+
+
+def is_bias_variable(var) -> bool:
+    name = str(getattr(var, "path", None) or getattr(var, "name", "")).lower()
+    return name.endswith("bias") or "/bias" in name or ".bias" in name

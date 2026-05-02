@@ -39,13 +39,30 @@ class TaskAlignedAssigner:
         pd_bboxes = tf.stop_gradient(tf.cast(pd_bboxes, tf.float32))
         anchor_points = tf.stop_gradient(tf.cast(anchor_points, tf.float32))
         gt_bboxes = tf.cast(gt_bboxes, tf.float32)
-        gt_labels = tf.cast(gt_labels, tf.int32)
-        mask_gt = tf.cast(mask_gt, tf.bool) & (tf.reduce_sum(gt_bboxes, axis=-1) > 0)
+        gt_labels = tf.convert_to_tensor(gt_labels)
+        mask_gt = tf.convert_to_tensor(mask_gt)
+        gt_labels = tf.cast(tf.squeeze(gt_labels, axis=-1) if gt_labels.shape.rank == 3 else gt_labels, tf.int32)
+        mask_gt = tf.cast(tf.squeeze(mask_gt, axis=-1) if mask_gt.shape.rank == 3 else mask_gt, tf.bool)
+        mask_gt = mask_gt & (tf.reduce_sum(gt_bboxes, axis=-1) > 0)
 
         bsz = tf.shape(pd_scores)[0]
         anchors_n = tf.shape(pd_scores)[1]
         max_gt = tf.shape(gt_bboxes)[1]
+        has_gt = tf.reduce_any(mask_gt)
 
+        def empty_result():
+            target_bboxes = tf.zeros([bsz, anchors_n, 4], dtype=tf.float32)
+            target_scores = tf.zeros([bsz, anchors_n, self.num_classes], dtype=tf.float32)
+            fg_mask = tf.zeros([bsz, anchors_n], dtype=tf.bool)
+            target_gt_idx = tf.zeros([bsz, anchors_n], dtype=tf.int64)
+            return target_bboxes, target_scores, fg_mask, target_gt_idx
+
+        def assign_result():
+            return self._assign_non_empty(pd_scores, pd_bboxes, anchor_points, gt_labels, gt_bboxes, mask_gt)
+
+        return tf.cond(has_gt, assign_result, empty_result)
+
+    def _assign_non_empty(self, pd_scores, pd_bboxes, anchor_points, gt_labels, gt_bboxes, mask_gt):
         candidate_gt_bboxes = self._candidate_boxes(gt_bboxes, mask_gt)
         ap = anchor_points[None, None, :, :]
         gtb = candidate_gt_bboxes[:, :, None, :]
@@ -57,35 +74,31 @@ class TaskAlignedAssigner:
         )
         in_gts = in_gts & mask_gt[:, :, None]
 
-        ious = pairwise_iou_tf(gt_bboxes, pd_bboxes)
+        ious = tf.maximum(pairwise_iou_tf(gt_bboxes, pd_bboxes, ciou=True), 0.0)
         labels = tf.clip_by_value(gt_labels, 0, self.num_classes - 1)
         label_oh = tf.one_hot(labels, self.num_classes, dtype=pd_scores.dtype)
         cls_scores = tf.reduce_sum(pd_scores[:, None, :, :] * label_oh[:, :, None, :], axis=-1)
         metric = tf.pow(tf.maximum(cls_scores, 0.0), self.alpha) * tf.pow(tf.maximum(ious, 0.0), self.beta)
         metric = tf.where(in_gts, metric, tf.zeros_like(metric))
 
-        mask_pos = self._topk_mask(metric, self.topk)
-        if self.topk2 != self.topk:
-            mask_pos = self._topk_mask(tf.where(mask_pos, metric, tf.zeros_like(metric)), self.topk2)
-        mask_pos_f = tf.cast(mask_pos, tf.float32)
+        topk_mask = tf.tile(mask_gt[:, :, None], [1, 1, self.topk])
+        mask_topk = self._select_topk_candidates(metric, topk_mask)
+        mask_pos = mask_topk * tf.cast(in_gts, tf.float32) * tf.cast(mask_gt[:, :, None], tf.float32)
+        target_gt_idx, fg_mask_f, mask_pos = self._select_highest_overlaps(mask_pos, ious, metric)
 
-        overlaps = ious * mask_pos_f
-        best_gt_idx = tf.argmax(overlaps, axis=1, output_type=tf.int32)
-        best_overlap = tf.reduce_max(overlaps, axis=1)
-        fg_mask = best_overlap > 0
-        target_gt_idx = tf.cast(best_gt_idx, tf.int64)
-        target_bboxes = tf.gather(gt_bboxes, best_gt_idx, batch_dims=1)
-        target_labels = tf.gather(labels, best_gt_idx, batch_dims=1)
+        target_bboxes = tf.gather(gt_bboxes, target_gt_idx, batch_dims=1)
+        target_labels = tf.gather(labels, target_gt_idx, batch_dims=1)
+        fg_mask = fg_mask_f > 0
 
-        gt_selector = tf.one_hot(best_gt_idx, max_gt, dtype=tf.float32)
-        selected_metric = tf.reduce_sum(tf.transpose(metric, [0, 2, 1]) * gt_selector, axis=-1)
-        pos_metric_max = tf.reduce_max(metric * mask_pos_f, axis=-1)
-        pos_iou_max = tf.reduce_max(ious * mask_pos_f, axis=-1)
-        selected_metric_max = tf.reduce_sum(pos_metric_max[:, None, :] * gt_selector, axis=-1)
-        selected_iou_max = tf.reduce_sum(pos_iou_max[:, None, :] * gt_selector, axis=-1)
-        norm = selected_metric / (selected_metric_max + self.eps) * selected_iou_max
-        norm = tf.where(fg_mask, tf.maximum(norm, self.eps), tf.zeros_like(norm))
-        target_scores = tf.one_hot(target_labels, self.num_classes, dtype=tf.float32) * norm[..., None]
+        target_scores = tf.one_hot(target_labels, self.num_classes, dtype=tf.float32)
+        target_scores = tf.where(fg_mask[:, :, None], target_scores, tf.zeros_like(target_scores))
+
+        align_metric = metric * mask_pos
+        pos_align_metrics = tf.reduce_max(align_metric, axis=-1, keepdims=True)
+        pos_overlaps = tf.reduce_max(ious * mask_pos, axis=-1, keepdims=True)
+        norm_align_metric = tf.reduce_max(align_metric * pos_overlaps / (pos_align_metrics + self.eps), axis=1)
+        target_scores = target_scores * norm_align_metric[:, :, None]
+        target_gt_idx = tf.cast(target_gt_idx, tf.int64)
         return target_bboxes, target_scores, fg_mask, target_gt_idx
 
     def _candidate_boxes(self, gt_bboxes, mask_gt):
@@ -100,23 +113,83 @@ class TaskAlignedAssigner:
         half = wh * 0.5
         return tf.concat([cx - half[..., 0:1], cy - half[..., 1:2], cx + half[..., 0:1], cy + half[..., 1:2]], axis=-1)
 
-    def _topk_mask(self, metric, topk: int):
-        k = tf.minimum(tf.cast(topk, tf.int32), tf.shape(metric)[-1])
-        values, _ = tf.math.top_k(metric, k=k)
-        threshold = values[..., -1:]
-        return (metric >= tf.maximum(threshold, self.eps)) & (metric > self.eps)
+    def _select_topk_candidates(self, metrics, topk_mask=None):
+        """Match Ultralytics top-k scatter-add selection and duplicate suppression."""
+        k = tf.minimum(tf.cast(self.topk, tf.int32), tf.shape(metrics)[-1])
+        topk_metrics, topk_idxs = tf.math.top_k(metrics, k=k, sorted=True)
+        if topk_mask is None:
+            topk_mask = tf.tile(tf.reduce_max(topk_metrics, axis=-1, keepdims=True) > self.eps, [1, 1, k])
+        else:
+            topk_mask = tf.cast(topk_mask[..., :k], tf.bool)
+        topk_idxs = tf.where(topk_mask, topk_idxs, tf.zeros_like(topk_idxs))
+
+        b = tf.shape(metrics)[0]
+        m = tf.shape(metrics)[1]
+        a = tf.shape(metrics)[2]
+        bm = b * m
+        flat_idx = tf.reshape(topk_idxs, [bm, k])
+        row = tf.tile(tf.range(bm, dtype=tf.int32)[:, None], [1, k])
+        scatter_idx = tf.stack([tf.reshape(row, [-1]), tf.reshape(flat_idx, [-1])], axis=-1)
+        updates = tf.ones([tf.shape(scatter_idx)[0]], dtype=tf.int32)
+        counts = tf.scatter_nd(scatter_idx, updates, [bm, a])
+        counts = tf.where(counts > 1, tf.zeros_like(counts), counts)
+        return tf.reshape(tf.cast(counts, metrics.dtype), [b, m, a])
+
+    def _select_highest_overlaps(self, mask_pos, overlaps, align_metric):
+        """Match Ultralytics multi-GT conflict resolution and optional topk2 pruning."""
+        fg_mask = tf.reduce_sum(mask_pos, axis=1)
+
+        def resolve_multi():
+            n_max_boxes = tf.shape(mask_pos)[1]
+            mask_multi = tf.tile((fg_mask[:, None, :] > 1), [1, n_max_boxes, 1])
+            max_overlaps_idx = tf.argmax(overlaps, axis=1, output_type=tf.int32)
+            is_max = tf.one_hot(max_overlaps_idx, n_max_boxes, dtype=mask_pos.dtype)
+            is_max = tf.transpose(is_max, [0, 2, 1])
+            resolved = tf.where(mask_multi, is_max, mask_pos)
+            return resolved, tf.reduce_sum(resolved, axis=1)
+
+        mask_pos, fg_mask = tf.cond(tf.reduce_max(fg_mask) > 1, resolve_multi, lambda: (mask_pos, fg_mask))
+
+        if self.topk2 != self.topk:
+            k2 = tf.minimum(tf.cast(self.topk2, tf.int32), tf.shape(mask_pos)[-1])
+            topk_idx = tf.math.top_k(align_metric * mask_pos, k=k2, sorted=True).indices
+            b = tf.shape(mask_pos)[0]
+            m = tf.shape(mask_pos)[1]
+            a = tf.shape(mask_pos)[2]
+            bm = b * m
+            flat_idx = tf.reshape(topk_idx, [bm, k2])
+            row = tf.tile(tf.range(bm, dtype=tf.int32)[:, None], [1, k2])
+            scatter_idx = tf.stack([tf.reshape(row, [-1]), tf.reshape(flat_idx, [-1])], axis=-1)
+            updates = tf.ones([tf.shape(scatter_idx)[0]], dtype=mask_pos.dtype)
+            topk_mask = tf.reshape(tf.scatter_nd(scatter_idx, updates, [bm, a]), [b, m, a])
+            mask_pos = mask_pos * topk_mask
+            fg_mask = tf.reduce_sum(mask_pos, axis=1)
+
+        target_gt_idx = tf.argmax(mask_pos, axis=1, output_type=tf.int32)
+        return target_gt_idx, fg_mask, mask_pos
 
 
-def pairwise_iou_tf(boxes1, boxes2, eps: float = 1e-7):
-    """Pairwise IoU for boxes shaped [B, N, 4] and [B, A, 4]."""
+def pairwise_iou_tf(boxes1, boxes2, eps: float = 1e-7, ciou: bool = False):
+    """Pairwise IoU/CIoU for boxes shaped [B, N, 4] and [B, A, 4]."""
     b1 = boxes1[:, :, None, :]
     b2 = boxes2[:, None, :, :]
     inter_w = tf.maximum(tf.minimum(b1[..., 2], b2[..., 2]) - tf.maximum(b1[..., 0], b2[..., 0]), 0.0)
     inter_h = tf.maximum(tf.minimum(b1[..., 3], b2[..., 3]) - tf.maximum(b1[..., 1], b2[..., 1]), 0.0)
     inter = inter_w * inter_h
-    area1 = tf.maximum(b1[..., 2] - b1[..., 0], 0.0) * tf.maximum(b1[..., 3] - b1[..., 1], 0.0)
-    area2 = tf.maximum(b2[..., 2] - b2[..., 0], 0.0) * tf.maximum(b2[..., 3] - b2[..., 1], 0.0)
-    return inter / (area1 + area2 - inter + eps)
+    w1 = tf.maximum(b1[..., 2] - b1[..., 0], 0.0)
+    h1 = tf.maximum(b1[..., 3] - b1[..., 1], 0.0)
+    w2 = tf.maximum(b2[..., 2] - b2[..., 0], 0.0)
+    h2 = tf.maximum(b2[..., 3] - b2[..., 1], 0.0)
+    iou = inter / (w1 * h1 + w2 * h2 - inter + eps)
+    if not ciou:
+        return iou
+    cw = tf.maximum(b1[..., 2], b2[..., 2]) - tf.minimum(b1[..., 0], b2[..., 0])
+    ch = tf.maximum(b1[..., 3], b2[..., 3]) - tf.minimum(b1[..., 1], b2[..., 1])
+    c2 = cw * cw + ch * ch + eps
+    rho2 = ((b2[..., 0] + b2[..., 2] - b1[..., 0] - b1[..., 2]) ** 2 + (b2[..., 1] + b2[..., 3] - b1[..., 1] - b1[..., 3]) ** 2) / 4
+    v = (4 / 3.141592653589793**2) * tf.square(tf.atan(w2 / (h2 + eps)) - tf.atan(w1 / (h1 + eps)))
+    alpha = v / (v - iou + (1.0 + eps))
+    return iou - (rho2 / c2 + v * alpha)
 
 
 class BboxLoss:
@@ -167,15 +240,48 @@ class DetectionLoss:
         class_weights = self.hyp.get("class_weights")
         self.class_weights = None if class_weights is None else tf.reshape(tf.cast(class_weights, tf.float32), [1, 1, -1])
 
-    def _targets_to_xyxy(self, batch, imgsz):
+    def preprocess(self, targets, batch_size, scale_tensor):
+        """Mirror Ultralytics target preprocessing from flat batch_idx/cls/xywh rows."""
+        targets = tf.cast(targets, tf.float32)
+        batch_size = tf.cast(batch_size, tf.int32)
+
+        def no_targets():
+            return tf.zeros([batch_size, 0, 5], dtype=tf.float32)
+
+        def with_targets():
+            batch_idx = tf.cast(targets[:, 0], tf.int32)
+            counts = tf.math.bincount(batch_idx, minlength=batch_size, maxlength=batch_size, dtype=tf.int32)
+            max_count = tf.reduce_max(counts)
+            offsets = tf.concat([[0], tf.cumsum(counts)[:-1]], axis=0)
+            within_idx = tf.range(tf.shape(targets)[0], dtype=tf.int32) - tf.gather(offsets, batch_idx)
+            indices = tf.stack([batch_idx, within_idx], axis=1)
+            out = tf.scatter_nd(indices, targets[:, 1:], [batch_size, max_count, 5])
+            xywh = out[..., 1:5] * tf.reshape(tf.cast(scale_tensor, out.dtype), [1, 1, 4])
+            x, y, w, h = tf.split(xywh, 4, axis=-1)
+            xyxy = tf.concat([x - w / 2, y - h / 2, x + w / 2, y + h / 2], axis=-1)
+            return tf.concat([out[..., 0:1], xyxy], axis=-1)
+
+        return tf.cond(tf.shape(targets)[0] == 0, no_targets, with_targets)
+
+    def _targets_to_flat(self, batch):
         bboxes = tf.cast(batch["bboxes"], tf.float32)
-        cls = tf.cast(batch["cls"], tf.int64)
+        cls = tf.cast(batch["cls"], tf.float32)
         mask = tf.cast(batch.get("mask", tf.reduce_sum(bboxes, axis=-1) > 0), tf.bool)
-        scale = tf.reshape(tf.cast([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], bboxes.dtype), [1, 1, 4])
-        xywh = bboxes * scale
-        x, y, w, h = tf.split(xywh, 4, axis=-1)
-        xyxy = tf.concat([x - w / 2, y - h / 2, x + w / 2, y + h / 2], axis=-1)
-        return cls, xyxy, mask
+        idx = tf.where(mask)
+        batch_idx = tf.cast(idx[:, 0:1], tf.float32)
+        cls_flat = tf.gather_nd(cls, idx)[:, None]
+        bboxes_flat = tf.gather_nd(bboxes, idx)
+        return tf.concat([batch_idx, cls_flat, bboxes_flat], axis=-1)
+
+    def _targets_to_xyxy(self, batch, imgsz):
+        targets = self._targets_to_flat(batch)
+        batch_size = tf.shape(batch["img"])[0]
+        scale = tf.cast([imgsz[1], imgsz[0], imgsz[1], imgsz[0]], tf.float32)
+        out = self.preprocess(targets, batch_size, scale)
+        gt_labels = tf.cast(out[..., 0:1], tf.int64)
+        gt_bboxes = out[..., 1:5]
+        mask_gt = tf.reduce_sum(gt_bboxes, axis=-1, keepdims=True) > 0
+        return gt_labels, gt_bboxes, mask_gt
 
     def bbox_decode(self, anchor_points, pred_dist):
         return dist2bbox(pred_dist, anchor_points[None, :, :], xywh=False)

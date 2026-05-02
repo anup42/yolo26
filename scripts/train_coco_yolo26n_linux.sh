@@ -31,6 +31,11 @@ EPOCHS_FULL="${YOLO26_COCO_EPOCHS_FULL:-300}"
 PROJECT="${YOLO26_COCO_PROJECT:-$OUT_DIR}"
 NAME="${YOLO26_COCO_NAME:-scratch_${PROFILE}}"
 
+mkdir -p "$OUT_DIR"
+LOG_FILE="${YOLO26_COCO_LOG:-$OUT_DIR/train_coco_yolo26n.log}"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Logging to $LOG_FILE"
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2
@@ -151,7 +156,7 @@ python -m yolo26_tf.cli detect train \
   --weight-decay "${YOLO26_COCO_WEIGHT_DECAY:-0.0005}" \
   --warmup-epochs "${YOLO26_COCO_WARMUP_EPOCHS:-3.0}" \
   --close-mosaic "${YOLO26_COCO_CLOSE_MOSAIC:-10}" \
-  --workers "${YOLO26_COCO_WORKERS:-4}" \
+  --workers "${YOLO26_COCO_WORKERS:-8}" \
   --cache \
   --amp \
   --require-gpu \

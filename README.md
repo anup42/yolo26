@@ -103,5 +103,21 @@ The script:
 - trains scratch `yolo26n.yaml` with `yolo26-tf detect train`;
 - validates with pycocotools COCOeval;
 - exports `best.weights.h5` to TFLite and reloads the TFLite model for inference.
+- streams all shell/training output to `runs/train/yolo26n_tf_coco/train_coco_yolo26n.log` by default.
 
 Important: the code path is now COCO-capable, but the repository does not claim the official 40.1 e2e mAP until a complete full COCO scratch training run has actually been executed and recorded. Use converted-checkpoint validation for direct checkpoint parity, and use the full profile above for scratch reproduction experiments.
+
+## Parity Checks
+
+Use the optional parity harness when PyTorch and Ultralytics are installed:
+
+```bash
+python scripts/parity_check_yolo26.py --weights yolo26n.pt --imgsz 64
+```
+
+It compares:
+
+- converted TensorFlow forward outputs against the upstream PyTorch checkpoint;
+- TensorFlow `TaskAlignedAssigner` behavior against Ultralytics for small-box and multi-GT conflict cases.
+
+The automated test suite also includes these assigner parity checks when the optional upstream dependencies are available.

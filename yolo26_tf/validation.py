@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,16 +36,24 @@ def validate_detection_model(
     data_dict = load_data_yaml(data)
     ds = YOLODataset(data_dict, "val", imgsz, batch, augment=False, shuffle=False, rect=rect)
     preds_all, targets_all, coco_rows, image_ids = [], [], [], []
+    seen = 0
+    t_infer = 0.0
+    t_post = 0.0
     for b in ds:
+        t0 = time.perf_counter()
         raw = model(tf.convert_to_tensor(b["img"], tf.float32), training=False).numpy()
+        t_infer += time.perf_counter() - t0
+        t1 = time.perf_counter()
         for pred, im_file, shape, ratio, pad in zip(raw, b["im_file"], b["ori_shape"], b["ratio"], b["pad"]):
             det = prediction_to_detections(pred, conf=conf, iou=iou, max_det=max_det)
             preds_all.append(det.astype(np.float32))
+            seen += 1
             if use_coco:
                 image_id = coco_image_id_from_path(im_file)
                 image_ids.append(image_id)
                 coco_rows.extend(detections_to_coco_rows(det, image_id, shape, imgsz, ratio, pad))
         targets_all.extend(targets_from_batch(b, imgsz))
+        t_post += time.perf_counter() - t1
     if use_coco:
         ann = data_dict.get("val_annotations") or data_dict.get("annotations")
         if ann is None:
@@ -56,6 +65,13 @@ def validate_detection_model(
         metrics = evaluate_coco_predictions(ann, coco_rows, image_ids=image_ids)
     else:
         metrics = ap_per_class(preds_all, targets_all, iou_thres=0.5)
+    metrics = {
+        **metrics,
+        "images": int(seen),
+        "predictions": int(sum(len(x) for x in preds_all)),
+        "speed/inference_ms_per_image": float(t_infer * 1000 / max(seen, 1)),
+        "speed/postprocess_ms_per_image": float(t_post * 1000 / max(seen, 1)),
+    }
     if verbose:
         print(metrics)
     return metrics

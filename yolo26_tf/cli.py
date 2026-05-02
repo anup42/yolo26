@@ -29,7 +29,7 @@ def add_train_args(parser):
     parser.add_argument("--close-mosaic", type=int, default=10)
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--gpus")
     parser.add_argument("--cache", action="store_true")
     parser.add_argument("--rect", action="store_true")

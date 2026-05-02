@@ -18,3 +18,7 @@ def test_tiny_training_predict_export(tmp_path):
     assert len(pred) >= 1
     exported = y.export(format="saved_model", output=tmp_path / "saved", imgsz=64)
     assert Path(exported).exists()
+    assert (Path(exported) / "metadata.json").exists()
+    tflite = y.export(format="tflite", output=tmp_path / "model.tflite", imgsz=64)
+    assert Path(tflite).exists()
+    assert Path(tflite + ".metadata.json").exists()
