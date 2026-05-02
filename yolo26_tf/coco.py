@@ -280,9 +280,11 @@ def evaluate_coco_predictions(ann_file: str | Path, predictions: list[dict], ima
     evaluator.accumulate()
     evaluator.summarize()
     stats = evaluator.stats.tolist()
+    map5095 = float(stats[0])
+    map50 = float(stats[1])
     return {
-        "metrics/mAP50-95(B)": float(stats[0]),
-        "metrics/mAP50(B)": float(stats[1]),
+        "metrics/mAP50-95(B)": map5095,
+        "metrics/mAP50(B)": map50,
         "metrics/mAP75(B)": float(stats[2]),
         "metrics/mAP50-95_small(B)": float(stats[3]),
         "metrics/mAP50-95_medium(B)": float(stats[4]),
@@ -290,6 +292,6 @@ def evaluate_coco_predictions(ann_file: str | Path, predictions: list[dict], ima
         "metrics/AR1(B)": float(stats[6]),
         "metrics/AR10(B)": float(stats[7]),
         "metrics/AR100(B)": float(stats[8]),
-        "fitness": float(stats[0]),
+        "fitness": float(0.1 * map50 + 0.9 * map5095),
         "predictions": len(predictions),
     }

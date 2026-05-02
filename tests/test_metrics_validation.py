@@ -1,6 +1,6 @@
 import numpy as np
 
-from yolo26_tf.metrics import ConfusionMatrix, DetMetrics, ap_per_class, targets_from_batch
+from yolo26_tf.metrics import ConfusionMatrix, DetMetrics, ap_per_class, process_batch, targets_from_batch
 from yolo26_tf.validation import prediction_to_detections
 
 
@@ -43,6 +43,44 @@ def test_det_metrics_exposes_ultralytics_keys():
     assert all(k in result for k in DetMetrics.keys)
     assert metrics.fitness > 0.99
     assert metrics.summary()[0]["Class"] == "object"
+
+
+def test_det_metrics_stats_path_matches_prediction_path():
+    det = np.array([[0, 0, 10, 10, 0.9, 0], [20, 20, 30, 30, 0.8, 1]], dtype=np.float32)
+    gt_cls = np.array([0], dtype=np.int64)
+    gt_boxes = np.array([[0, 0, 10, 10]], dtype=np.float32)
+    correct = process_batch(det, gt_cls, gt_boxes)
+
+    metrics = DetMetrics(names={0: "object", 1: "other"})
+    metrics.update_stats(
+        {
+            "tp": correct,
+            "conf": det[:, 4],
+            "pred_cls": det[:, 5],
+            "target_cls": gt_cls,
+            "target_img": np.unique(gt_cls),
+            "im_name": np.array(["img0.jpg"], dtype=object),
+        }
+    )
+    result = metrics.process()
+    assert result["metrics/mAP50(B)"] > 0.99
+    assert result["nt_per_class"] == {0: 1}
+
+
+def test_det_metrics_stats_path_keeps_target_counts_without_predictions():
+    metrics = DetMetrics(names={0: "object"})
+    metrics.update_stats(
+        {
+            "tp": np.zeros((0, 10), dtype=bool),
+            "conf": np.zeros((0,), dtype=np.float32),
+            "pred_cls": np.zeros((0,), dtype=np.float32),
+            "target_cls": np.array([0], dtype=np.int64),
+            "target_img": np.array([0], dtype=np.int64),
+        }
+    )
+    result = metrics.process()
+    assert result["metrics/mAP50(B)"] == 0.0
+    assert result["nt_per_class"] == {0: 1}
 
 
 def test_prediction_to_detections_supports_multi_label_nms():

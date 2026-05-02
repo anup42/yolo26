@@ -63,7 +63,7 @@ Notes:
 
 ## COCO Scratch Training
 
-The TensorFlow training stack now includes the YOLO26n detection pieces needed for real scratch COCO runs: YOLO/COCO dataset loading, threaded label verification/cache metadata with hash/version checks, segment-aware labels, class filtering, `single_cls`, rectangular validation shapes, flat `batch_idx/cls/bboxes` targets, Ultralytics-style transform objects (`Instances`, `Compose`, `LetterBox`, `Mosaic`, `RandomPerspective`, `CopyPaste`, `MixUp`, `CutMix`, `Albumentations`, `RandomHSV`, `RandomFlip`, `Format`), close-mosaic, multi-scale training, EMA, warmup/cosine LR, gradient clipping/accumulation, AMP, freeze/time controls, CSV/results logging, checkpoint resume, NaN checkpoint recovery, final best-checkpoint validation, COCOeval validation, and TFLite export/reload verification.
+The TensorFlow training stack now includes the YOLO26n detection pieces needed for real scratch COCO runs: YOLO/COCO dataset loading, threaded label verification/cache metadata with hash/version checks, segment-aware labels, class filtering, `single_cls`, rectangular validation shapes, flat `batch_idx/cls/bboxes` targets, Ultralytics-style transform objects (`Instances`, `Compose`, `LetterBox`, `Mosaic`, `RandomPerspective`, `CopyPaste`, `MixUp`, `CutMix`, `Albumentations`, `RandomHSV`, `RandomFlip`, `Format`) wired through the trainer iterator, close-mosaic, multi-scale training, EMA, warmup/cosine LR, gradient clipping/accumulation, AMP, class-weight scaling, freeze/time controls, CSV/results logging, checkpoint resume, NaN checkpoint recovery, final best-checkpoint validation, COCOeval validation, and SavedModel/TFLite export/reload verification.
 
 Use the Linux GPU-only runner:
 
@@ -131,4 +131,4 @@ python scripts/parity_check_yolo26.py --weights yolo26n.pt --imgsz 64 --bbox-los
 python scripts/parity_check_yolo26.py --weights yolo26n.pt --imgsz 64 --e2e-loss
 ```
 
-The automated test suite also covers dataset cache/rectangular target behavior, transform/collate contracts, AP50-95 metrics, confusion matrix accounting, multi-label postprocess, optimizer grouping, tiny training, prediction, and TFLite export/reload smoke paths.
+The automated test suite also covers dataset cache/rectangular target behavior, trainer transform/collate contracts, AP50-95 stats accumulation, confusion matrix accounting, multi-label postprocess, optimizer grouping, tiny training, prediction, and SavedModel/TFLite export/reload smoke paths.

@@ -29,7 +29,6 @@ def ap_per_class(preds: list[np.ndarray], targets: list[tuple[np.ndarray, np.nda
         target_cls_all.extend(gt_cls.tolist())
         correct = np.zeros((len(pred), len(iouv)), dtype=bool)
         if len(pred) and len(gt_cls):
-            detected = set()
             for cls in np.unique(np.concatenate([pred[:, 5].astype(np.int64), gt_cls])):
                 pi = np.where(pred[:, 5].astype(np.int64) == cls)[0]
                 ti = np.where(gt_cls == cls)[0]
@@ -44,11 +43,10 @@ def ap_per_class(preds: list[np.ndarray], targets: list[tuple[np.ndarray, np.nda
                     match_rows.sort(reverse=True)
                     used_p, used_t = set(), set()
                     for iou, p_abs, t_abs in match_rows:
-                        if p_abs in used_p or t_abs in used_t or t_abs in detected:
+                        if p_abs in used_p or t_abs in used_t:
                             continue
                         used_p.add(p_abs)
                         used_t.add(t_abs)
-                        detected.add(t_abs)
                         correct[p_abs] = iou >= iouv
         if len(pred):
             stats.append((correct, pred[:, 4].astype(np.float32), pred[:, 5].astype(np.int64), gt_cls))
@@ -85,13 +83,100 @@ def ap_per_class(preds: list[np.ndarray], targets: list[tuple[np.ndarray, np.nda
     mr = float(recall_cls.mean()) if len(recall_cls) else 0.0
     map50 = float(ap[:, 0].mean()) if ap.size else 0.0
     map5095 = float(ap.mean()) if ap.size else 0.0
+    fitness = 0.1 * map50 + 0.9 * map5095
     return {
         "metrics/precision(B)": mp,
         "metrics/recall(B)": mr,
         "metrics/mAP50(B)": map50,
         "metrics/mAP50-95(B)": map5095,
-        "fitness": map5095,
+        "fitness": float(fitness),
         "nt_per_class": {int(c): int(n) for c, n in zip(unique_classes, nt_per_class)},
+        "ap_class_index": [int(x) for x in unique_classes],
+    }
+
+
+def process_batch(detections: np.ndarray, gt_cls: np.ndarray, gt_boxes: np.ndarray, iouv=None) -> np.ndarray:
+    """Return the Ultralytics-style correct-prediction matrix for one image."""
+    iouv = np.asarray(iouv if iouv is not None else IOU_THRESHOLDS, dtype=np.float32)
+    correct = np.zeros((len(detections), len(iouv)), dtype=bool)
+    if len(detections) == 0 or len(gt_cls) == 0:
+        return correct
+    ious = pairwise_iou_np(gt_boxes, detections[:, :4])
+    matches = np.argwhere(ious >= iouv[0])
+    if len(matches) == 0:
+        return correct
+    rows = []
+    for gt_i, pred_i in matches:
+        if int(gt_cls[gt_i]) == int(detections[pred_i, 5]):
+            rows.append((float(ious[gt_i, pred_i]), int(gt_i), int(pred_i)))
+    rows.sort(reverse=True)
+    used_gt, used_pred = set(), set()
+    for iou, gt_i, pred_i in rows:
+        if gt_i in used_gt or pred_i in used_pred:
+            continue
+        used_gt.add(gt_i)
+        used_pred.add(pred_i)
+        correct[pred_i] = iou >= iouv
+    return correct
+
+
+def ap_per_class_from_stats(stats: dict[str, list[np.ndarray]], iou_thres=None) -> dict:
+    """Compute metrics from accumulated Ultralytics-style stats arrays."""
+    if not stats.get("target_cls"):
+        return empty_metrics(0)
+    target_cls = np.concatenate(stats["target_cls"], axis=0).astype(np.int64)
+    if len(target_cls) == 0:
+        return empty_metrics(0)
+    unique_classes = np.unique(target_cls)
+    nt_per_class = np.array([(target_cls == c).sum() for c in unique_classes], dtype=np.float32)
+    nt_per_image = {}
+    if stats.get("target_img"):
+        for c in unique_classes:
+            nt_per_image[int(c)] = int(sum((np.asarray(x) == c).sum() for x in stats["target_img"]))
+    if not stats.get("conf") or sum(len(x) for x in stats["conf"]) == 0:
+        result = empty_metrics(len(target_cls))
+        result.update(
+            {
+                "nt_per_class": {int(c): int(n) for c, n in zip(unique_classes, nt_per_class)},
+                "nt_per_image": nt_per_image,
+                "ap_class_index": [int(x) for x in unique_classes],
+            }
+        )
+        return result
+    correct = np.concatenate(stats["tp"], axis=0)
+    conf = np.concatenate(stats["conf"], axis=0).astype(np.float32)
+    pred_cls = np.concatenate(stats["pred_cls"], axis=0).astype(np.int64)
+    iouv = np.asarray(iou_thres if iou_thres is not None else IOU_THRESHOLDS, dtype=np.float32)
+    order = np.argsort(-conf)
+    correct, pred_cls = correct[order], pred_cls[order]
+    ap = np.zeros((len(unique_classes), len(iouv)), dtype=np.float32)
+    precision_cls = np.zeros(len(unique_classes), dtype=np.float32)
+    recall_cls = np.zeros(len(unique_classes), dtype=np.float32)
+    for ci, c in enumerate(unique_classes):
+        idx = pred_cls == c
+        n_l = nt_per_class[ci]
+        n_p = idx.sum()
+        if n_p == 0 or n_l == 0:
+            continue
+        tpc = correct[idx].cumsum(0)
+        fpc = (1 - correct[idx]).cumsum(0)
+        recall = tpc / (n_l + 1e-16)
+        precision = tpc / (tpc + fpc + 1e-16)
+        precision_cls[ci] = precision[-1, 0]
+        recall_cls[ci] = recall[-1, 0]
+        for j in range(len(iouv)):
+            ap[ci, j] = compute_ap(recall[:, j], precision[:, j])
+    map50 = float(ap[:, 0].mean()) if ap.size else 0.0
+    map5095 = float(ap.mean()) if ap.size else 0.0
+    fitness = 0.1 * map50 + 0.9 * map5095
+    return {
+        "metrics/precision(B)": float(precision_cls.mean()) if len(precision_cls) else 0.0,
+        "metrics/recall(B)": float(recall_cls.mean()) if len(recall_cls) else 0.0,
+        "metrics/mAP50(B)": map50,
+        "metrics/mAP50-95(B)": map5095,
+        "fitness": float(fitness),
+        "nt_per_class": {int(c): int(n) for c, n in zip(unique_classes, nt_per_class)},
+        "nt_per_image": nt_per_image,
         "ap_class_index": [int(x) for x in unique_classes],
     }
 
@@ -184,19 +269,28 @@ class DetMetrics:
         self.results_dict = empty_metrics()
         self.curves_results: dict[str, list] = {}
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
+        self.stats: dict[str, list[np.ndarray]] = {"tp": [], "conf": [], "pred_cls": [], "target_cls": [], "target_img": [], "im_name": []}
         self.clear_stats()
 
     def clear_stats(self):
         self.preds: list[np.ndarray] = []
         self.targets: list[tuple[np.ndarray, np.ndarray]] = []
+        self.stats = {"tp": [], "conf": [], "pred_cls": [], "target_cls": [], "target_img": [], "im_name": []}
 
-    def update_stats(self, preds: list[np.ndarray], targets: list[tuple[np.ndarray, np.ndarray]]):
+    def update_stats(self, preds, targets: list[tuple[np.ndarray, np.ndarray]] | None = None):
+        if isinstance(preds, dict):
+            for key in self.stats:
+                value = preds.get(key)
+                if value is not None:
+                    self.stats[key].append(np.asarray(value))
+            return
         self.preds.extend(preds)
-        self.targets.extend(targets)
+        self.targets.extend(targets or [])
 
     def process(self) -> dict:
-        self.results_dict = ap_per_class(self.preds, self.targets)
+        self.results_dict = ap_per_class_from_stats(self.stats) if self.stats["target_cls"] else ap_per_class(self.preds, self.targets)
         self.nt_per_class = self.results_dict.get("nt_per_class", {})
+        self.nt_per_image = self.results_dict.get("nt_per_image", {})
         self.ap_class_index = self.results_dict.get("ap_class_index", [])
         self.curves_results = {
             "names": [self.names.get(i, str(i)) for i in self.ap_class_index],

@@ -56,6 +56,8 @@ def export_model(model, format: str = "keras", output: str | Path | None = None,
         path.parent.mkdir(parents=True, exist_ok=True)
         module = ServingModule(model, imgsz=imgsz, dynamic=kwargs.get("dynamic", True), nms=nms, conf=conf, iou=iou, max_det=max_det)
         tf.saved_model.save(module, str(path), signatures={"serving_default": module.serve})
+        if kwargs.get("verify", True):
+            verify_saved_model(path, imgsz)
         write_metadata(path, model, fmt, imgsz, kwargs)
         return str(path)
     if fmt == "tflite":
@@ -191,6 +193,19 @@ def verify_tflite(path: Path, imgsz: int):
         raise RuntimeError(f"TFLite verification produced empty output for {path}")
 
 
+def verify_saved_model(path: Path, imgsz: int):
+    loaded = tf.saved_model.load(str(path))
+    fn = loaded.signatures.get("serving_default")
+    if fn is None:
+        raise RuntimeError(f"SavedModel verification found no serving_default signature for {path}")
+    out = fn(tf.zeros([1, imgsz, imgsz, 3], tf.float32))
+    if not out:
+        raise RuntimeError(f"SavedModel verification produced no outputs for {path}")
+    first = next(iter(out.values()))
+    if int(tf.size(first).numpy()) == 0:
+        raise RuntimeError(f"SavedModel verification produced empty output for {path}")
+
+
 def write_metadata(path: Path, model, fmt: str, imgsz: int, kwargs: dict):
     meta = {
         "format": fmt,
@@ -198,6 +213,7 @@ def write_metadata(path: Path, model, fmt: str, imgsz: int, kwargs: dict):
         "task": "detect",
         "nc": int(getattr(model, "nc", 0)),
         "names": getattr(model, "names", None),
+        "stride": [float(x) for x in getattr(model, "strides", [])],
         "end2end": bool(getattr(getattr(model, "detect_layer", None), "end2end", True)),
         "reg_max": int(getattr(getattr(model, "detect_layer", None), "reg_max", 1)),
         "options": {k: str(v) for k, v in kwargs.items() if k not in {"representative_data"}},

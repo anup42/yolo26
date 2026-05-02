@@ -46,6 +46,7 @@ def add_train_args(parser):
     parser.add_argument("--val-coco", action="store_true")
     parser.add_argument("--save-period", type=int, default=-1)
     parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--cls-pw", type=float, default=0.0)
     parser.add_argument("--mosaic", type=float, default=1.0)
     parser.add_argument("--mixup", type=float, default=0.0)
     parser.add_argument("--cutmix", type=float, default=0.0)
@@ -175,6 +176,7 @@ def main(argv=None):
             val_coco=args.val_coco,
             save_period=args.save_period,
             log_interval=args.log_interval,
+            cls_pw=args.cls_pw,
             mosaic=args.mosaic,
             mixup=args.mixup,
             cutmix=args.cutmix,

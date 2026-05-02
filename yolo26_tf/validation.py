@@ -11,7 +11,7 @@ import numpy as np
 
 from .coco import COCO80_TO_COCO91, coco_image_id_from_path, evaluate_coco_predictions
 from .data import YOLODataset, load_data_yaml
-from .metrics import ConfusionMatrix, DetMetrics, targets_from_batch
+from .metrics import ConfusionMatrix, DetMetrics, process_batch, targets_from_batch
 from .ops import nms_numpy, scale_boxes_np
 from .tf_import import require_tf
 
@@ -51,11 +51,14 @@ def validate_detection_model(
     det_metrics = DetMetrics(names=data_dict.get("names", {}))
     confusion = ConfusionMatrix(data_dict["nc"], conf=conf, iou_thres=iou)
     seen = 0
+    t_pre = 0.0
     t_infer = 0.0
     t_post = 0.0
     for b in ds:
         t0 = time.perf_counter()
         images = tf.convert_to_tensor(b["img"], tf.float16 if half else tf.float32)
+        t_pre += time.perf_counter() - t0
+        t0 = time.perf_counter()
         raw = model(images, training=False).numpy()
         t_infer += time.perf_counter() - t0
         t1 = time.perf_counter()
@@ -72,6 +75,17 @@ def validate_detection_model(
             if single_cls and len(gt_cls):
                 gt_cls = np.zeros_like(gt_cls)
             confusion.process_batch(det, gt_cls, gt_boxes)
+            correct = process_batch(det, gt_cls, gt_boxes)
+            det_metrics.update_stats(
+                {
+                    "tp": correct,
+                    "conf": det[:, 4].astype(np.float32) if len(det) else np.zeros((0,), dtype=np.float32),
+                    "pred_cls": det[:, 5].astype(np.float32) if len(det) else np.zeros((0,), dtype=np.float32),
+                    "target_cls": gt_cls.astype(np.float32),
+                    "target_img": np.unique(gt_cls).astype(np.float32),
+                    "im_name": np.asarray([im_file], dtype=object),
+                }
+            )
             seen += 1
             if use_coco:
                 image_id = coco_image_id_from_path(im_file)
@@ -89,13 +103,13 @@ def validate_detection_model(
             (out_dir / "predictions.json").write_text(json.dumps(coco_rows), encoding="utf-8")
         metrics = evaluate_coco_predictions(ann, coco_rows, image_ids=image_ids)
     else:
-        det_metrics.update_stats(preds_all, targets_all)
         metrics = det_metrics.process()
     metrics = {
         **metrics,
         "images": int(seen),
         "predictions": int(sum(len(x) for x in preds_all)),
         "confusion_matrix": confusion.matrix.tolist(),
+        "speed/preprocess_ms_per_image": float(t_pre * 1000 / max(seen, 1)),
         "speed/inference_ms_per_image": float(t_infer * 1000 / max(seen, 1)),
         "speed/postprocess_ms_per_image": float(t_post * 1000 / max(seen, 1)),
     }
@@ -148,7 +162,45 @@ class DetectionValidator:
         return batch
 
     def postprocess(self, preds: np.ndarray) -> list[np.ndarray]:
-        return [prediction_to_detections(p, **{k: self.args[k] for k in ("conf", "iou", "max_det") if k in self.args}) for p in preds]
+        keys = ("conf", "iou", "max_det", "agnostic_nms", "multi_label")
+        opts = {k: self.args[k] for k in keys if k in self.args}
+        if "agnostic_nms" in opts:
+            opts["agnostic"] = opts.pop("agnostic_nms")
+        return [prediction_to_detections(p, **opts) for p in preds]
+
+    def _prepare_batch(self, batch: dict, input_shape: tuple[int, int]) -> list[tuple[np.ndarray, np.ndarray]]:
+        return targets_from_batch(batch, input_shape)
+
+    def _process_batch(self, detections: np.ndarray, gt_cls: np.ndarray, gt_boxes: np.ndarray) -> np.ndarray:
+        return process_batch(detections, gt_cls, gt_boxes)
+
+    def update_metrics(self, detections: np.ndarray, gt_cls: np.ndarray, gt_boxes: np.ndarray, im_file: str = ""):
+        if self.metrics is None:
+            self.metrics = DetMetrics()
+        self.metrics.update_stats(
+            {
+                "tp": self._process_batch(detections, gt_cls, gt_boxes),
+                "conf": detections[:, 4].astype(np.float32) if len(detections) else np.zeros((0,), dtype=np.float32),
+                "pred_cls": detections[:, 5].astype(np.float32) if len(detections) else np.zeros((0,), dtype=np.float32),
+                "target_cls": gt_cls.astype(np.float32),
+                "target_img": np.unique(gt_cls).astype(np.float32),
+                "im_name": np.asarray([im_file], dtype=object),
+            }
+        )
+
+    def get_stats(self) -> dict[str, Any]:
+        if self.metrics is None:
+            self.metrics = DetMetrics()
+        return self.metrics.process()
+
+    def pred_to_json(self, det: np.ndarray, image_id: int, ori_shape, input_shape, ratio, pad) -> list[dict]:
+        return detections_to_coco_rows(det, image_id, ori_shape, input_shape, ratio, pad)
+
+    def eval_json(self, ann_file: str | Path, rows: list[dict], image_ids: list[int] | None = None) -> dict[str, Any]:
+        return evaluate_coco_predictions(ann_file, rows, image_ids=image_ids)
+
+    def save_one_txt(self, det: np.ndarray, ori_shape, input_shape, ratio, pad, file: str | Path, save_conf: bool = False):
+        save_one_txt(det, ori_shape, input_shape, ratio, pad, Path(file), save_conf)
 
     def __call__(self, model=None, data=None, **kwargs) -> dict[str, Any]:
         model = model or self.model
@@ -185,8 +237,8 @@ def detections_to_coco_rows(det: np.ndarray, image_id: int, ori_shape, input_sha
             {
                 "image_id": int(image_id),
                 "category_id": int(COCO80_TO_COCO91[cls_idx]),
-                "bbox": [float(box[0]), float(box[1]), float(wh_i[0]), float(wh_i[1])],
-                "score": float(row[4]),
+                "bbox": [round(float(box[0]), 3), round(float(box[1]), 3), round(float(wh_i[0]), 3), round(float(wh_i[1]), 3)],
+                "score": round(float(row[4]), 5),
             }
         )
     return rows

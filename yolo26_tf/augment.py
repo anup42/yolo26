@@ -622,10 +622,12 @@ class RandomPerspective:
         self.pre_transform = pre_transform
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
-        if self.pre_transform is not None:
+        if self.pre_transform is not None and "mosaic_border" not in labels:
             labels = self.pre_transform(labels)
+        border = labels.pop("mosaic_border", self.border)
         img, boxes, cls = _labels_to_arrays(labels)
-        img, boxes, cls = random_perspective(img, boxes, cls, self.degrees, self.translate, self.scale, self.shear, self.perspective, self.border)
+        labels.pop("ratio_pad", None)
+        img, boxes, cls = random_perspective(img, boxes, cls, self.degrees, self.translate, self.scale, self.shear, self.perspective, border)
         return _arrays_to_labels(labels, img, boxes, cls)
 
     @staticmethod
@@ -698,10 +700,11 @@ class LetterBox:
     def __call__(self, labels=None, image=None):
         labels = {} if labels is None else labels
         img = labels.get("img") if image is None else image
-        if isinstance(self.new_shape, int):
-            new_shape = (self.new_shape, self.new_shape)
+        label_shape = labels.get("rect_shape", self.new_shape)
+        if isinstance(label_shape, int):
+            new_shape = (label_shape, label_shape)
         else:
-            new_shape = tuple(self.new_shape)
+            new_shape = tuple(label_shape)
         shape = img.shape[:2]
         r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
         if not self.scaleup:

@@ -23,8 +23,15 @@ from PIL import Image, ImageFile
 from .augment import (
     Albumentations,
     Compose,
+    CopyPaste,
+    CutMix,
     Format,
     LetterBox,
+    MixUp,
+    Mosaic,
+    RandomFlip,
+    RandomHSV,
+    RandomPerspective,
     albumentations,
     copy_paste_bbox_only,
     cutmix,
@@ -263,9 +270,11 @@ class YOLODataset:
             "fliplr": 0.5,
             "flipud": 0.0,
             "mosaic": 0.0,
+            "mosaic_n": 4,
             "mixup": 0.0,
             "cutmix": 0.0,
             "copy_paste": 0.0,
+            "copy_paste_mode": "flip",
             "degrees": 0.0,
             "translate": 0.1,
             "scale": 0.5,
@@ -300,6 +309,8 @@ class YOLODataset:
             self.batch_shapes = self._build_rect_batch_shapes()
         else:
             self.batch_shapes = None
+        self.transforms = self.build_transforms()
+        self.buffer: list[int] = []
         self.on_epoch_end()
 
     def __len__(self):
@@ -420,12 +431,43 @@ class YOLODataset:
         self.hyp["copy_paste"] = 0.0
         self.hyp["mixup"] = 0.0
         self.hyp["cutmix"] = 0.0
+        self.transforms = self.build_transforms()
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
         hyp = {**self.hyp, **(hyp or {})}
-        transforms = [LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment)]
         if self.augment:
-            transforms.append(Albumentations(p=1.0))
+            mosaic = Mosaic(self, imgsz=self.imgsz, p=hyp.get("mosaic", 0.0), n=int(hyp.get("mosaic_n", 4)))
+            affine = RandomPerspective(
+                degrees=hyp.get("degrees", 0.0),
+                translate=hyp.get("translate", 0.1),
+                scale=hyp.get("scale", 0.5),
+                shear=hyp.get("shear", 0.0),
+                perspective=hyp.get("perspective", 0.0),
+                pre_transform=LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=True),
+            )
+            pre_transform = Compose([mosaic, affine])
+            if hyp.get("copy_paste_mode", "flip") == "flip":
+                pre_transform.insert(1, CopyPaste(p=hyp.get("copy_paste", 0.0), mode="flip"))
+            else:
+                pre_transform.append(
+                    CopyPaste(
+                        self,
+                        pre_transform=Compose([Mosaic(self, imgsz=self.imgsz, p=hyp.get("mosaic", 0.0), n=int(hyp.get("mosaic_n", 4))), affine]),
+                        p=hyp.get("copy_paste", 0.0),
+                        mode=hyp.get("copy_paste_mode", "mixup"),
+                    )
+                )
+            transforms = [
+                pre_transform,
+                MixUp(self, pre_transform=pre_transform, p=hyp.get("mixup", 0.0)),
+                CutMix(self, pre_transform=pre_transform, p=hyp.get("cutmix", 0.0)),
+                Albumentations(p=1.0),
+                RandomHSV(hgain=hyp.get("hsv_h", 0.015), sgain=hyp.get("hsv_s", 0.7), vgain=hyp.get("hsv_v", 0.4)),
+                RandomFlip(direction="vertical", p=hyp.get("flipud", 0.0)),
+                RandomFlip(direction="horizontal", p=hyp.get("fliplr", 0.5)),
+            ]
+        else:
+            transforms = [LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)]
         transforms.append(Format(bbox_format="xywh", normalize=True, batch_idx=True, bgr=hyp.get("bgr", 0.0) if self.augment else 0.0))
         return Compose(transforms)
 
@@ -443,9 +485,21 @@ class YOLODataset:
         return label
 
     def get_image_and_label(self, idx: int) -> dict:
-        img, boxes, cls, path, shape, ratio, pad = self.load_one(idx)
+        path = self.im_files[idx]
+        img = np.asarray(Image.open(path).convert("RGB"))
+        shape = img.shape[:2]
         label = dict(self.labels[idx])
-        label.update({"img": img, "cls": cls, "bboxes": boxes, "im_file": path, "ori_shape": shape, "ratio_pad": (ratio, pad)})
+        label.update(
+            {
+                "img": img,
+                "cls": label["cls"].copy(),
+                "bboxes": label["bboxes"].copy(),
+                "im_file": str(path),
+                "ori_shape": shape,
+                "resized_shape": shape,
+                "ratio_pad": ((1.0, 1.0), (0, 0)),
+            }
+        )
         return self.update_labels_info(label)
 
     def read_label(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -568,38 +622,13 @@ class YOLODataset:
         if self.drop_last and len(batch_ids) < self.batch:
             raise IndexError(bi)
         rect_shape = tuple(self.batch_shapes[bi]) if self.batch_shapes is not None and bi < len(self.batch_shapes) else None
-        samples = [self.get(i, rect_shape=rect_shape) for i in batch_ids]
-        imgs = np.stack([s[0] for s in samples], axis=0)
-        max_boxes = max([len(s[1]) for s in samples] + [1])
-        bboxes = np.zeros((len(samples), max_boxes, 4), dtype=np.float32)
-        cls = np.zeros((len(samples), max_boxes), dtype=np.int64)
-        mask = np.zeros((len(samples), max_boxes), dtype=bool)
-        for i, (_, boxes_i, cls_i, *_rest) in enumerate(samples):
-            n = len(boxes_i)
-            if n:
-                bboxes[i, :n] = boxes_i
-                cls[i, :n] = cls_i
-                mask[i, :n] = True
-        flat_batch_idx, flat_cls, flat_boxes = [], [], []
-        for i in range(len(samples)):
-            valid = mask[i]
-            if valid.any():
-                flat_batch_idx.append(np.full((int(valid.sum()), 1), i, dtype=np.float32))
-                flat_cls.append(cls[i, valid, None].astype(np.float32))
-                flat_boxes.append(bboxes[i, valid].astype(np.float32))
-        return {
-            "img": imgs,
-            "bboxes": bboxes,
-            "cls": cls,
-            "mask": mask,
-            "batch_idx": np.concatenate(flat_batch_idx, axis=0) if flat_batch_idx else np.zeros((0, 1), dtype=np.float32),
-            "flat_cls": np.concatenate(flat_cls, axis=0) if flat_cls else np.zeros((0, 1), dtype=np.float32),
-            "flat_bboxes": np.concatenate(flat_boxes, axis=0) if flat_boxes else np.zeros((0, 4), dtype=np.float32),
-            "im_file": [s[3] for s in samples],
-            "ori_shape": [s[4] for s in samples],
-            "ratio": [s[5] for s in samples],
-            "pad": [s[6] for s in samples],
-        }
+        samples = []
+        for i in batch_ids:
+            labels = self.get_image_and_label(i)
+            if rect_shape is not None:
+                labels["rect_shape"] = rect_shape
+            samples.append(self.transforms(labels))
+        return self._collate_for_trainer(samples)
 
     @staticmethod
     def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -631,6 +660,42 @@ class YOLODataset:
             "ratio_pad": [x.get("ratio_pad") for x in batch],
         }
         return out
+
+    @staticmethod
+    def _collate_for_trainer(samples: list[dict[str, Any]]) -> dict[str, Any]:
+        flat = YOLODataset.collate_fn(samples)
+        batch_size = len(samples)
+        flat_batch = flat["batch_idx"].astype(np.int64).reshape(-1)
+        counts = np.bincount(flat_batch, minlength=batch_size) if len(flat_batch) else np.zeros((batch_size,), dtype=np.int64)
+        max_boxes = max(int(counts.max()) if len(counts) else 0, 1)
+        bboxes = np.zeros((batch_size, max_boxes, 4), dtype=np.float32)
+        cls = np.zeros((batch_size, max_boxes), dtype=np.int64)
+        mask = np.zeros((batch_size, max_boxes), dtype=bool)
+        cursors = np.zeros((batch_size,), dtype=np.int64)
+        flat_boxes = flat["bboxes"].astype(np.float32)
+        flat_cls = flat["cls"].reshape(-1).astype(np.int64)
+        for row_i, bi in enumerate(flat_batch):
+            pos = int(cursors[bi])
+            bboxes[bi, pos] = flat_boxes[row_i]
+            cls[bi, pos] = flat_cls[row_i]
+            mask[bi, pos] = True
+            cursors[bi] += 1
+        ratio_pad = flat.get("ratio_pad", [((1.0, 1.0), (0, 0)) for _ in samples])
+        ratio = [rp[0] if rp else (1.0, 1.0) for rp in ratio_pad]
+        pad = [rp[1] if rp else (0, 0) for rp in ratio_pad]
+        return {
+            "img": flat["img"].astype(np.float32),
+            "bboxes": bboxes,
+            "cls": cls,
+            "mask": mask,
+            "batch_idx": flat["batch_idx"].astype(np.float32),
+            "flat_cls": flat["cls"].astype(np.float32).reshape(-1, 1),
+            "flat_bboxes": flat["bboxes"].astype(np.float32),
+            "im_file": flat["im_file"],
+            "ori_shape": flat["ori_shape"],
+            "ratio": ratio,
+            "pad": pad,
+        }
 
     def numeric_batches(self):
         for b in self:

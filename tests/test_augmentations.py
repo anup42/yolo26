@@ -42,6 +42,18 @@ def test_detection_augmentation_pipeline_preserves_valid_boxes(tmp_path):
     assert (valid_boxes[:, 2:] > 0.0).all()
 
 
+def test_dataset_iterator_uses_transform_collate_contract(tmp_path):
+    data_yaml = create_tiny_dataset(tmp_path / "tiny_iterator", n=4, size=48)
+    ds = YOLODataset(data_yaml, split="train", imgsz=48, batch=2, augment=True, hyp={"mosaic": 0.0, "mixup": 0.0, "cutmix": 0.0}, shuffle=False)
+    batch = ds[0]
+    assert batch["img"].shape == (2, 48, 48, 3)
+    assert batch["flat_bboxes"].shape[1] == 4
+    assert batch["flat_cls"].shape[1] == 1
+    assert batch["batch_idx"].shape[1] == 1
+    assert len(batch["ratio"]) == 2
+    assert len(batch["pad"]) == 2
+
+
 def test_instances_letterbox_format_pipeline():
     img = np.zeros((40, 80, 3), dtype=np.uint8)
     labels = {

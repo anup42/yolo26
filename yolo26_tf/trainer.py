@@ -65,6 +65,7 @@ class TrainConfig:
     max_det: int = 300
     save_period: int = -1
     log_interval: int = 10
+    cls_pw: float = 0.0
 
 
 DEFAULT_HYP = {
@@ -185,6 +186,7 @@ class YOLO26Trainer:
             classes=self.cfg.classes,
             single_cls=self.cfg.single_cls,
         )
+        self._set_class_weights(train_ds)
         if self.cfg.resume:
             self._load_resume_weights()
         iterations = max(len(train_ds) * self.cfg.epochs, 1)
@@ -211,6 +213,7 @@ class YOLO26Trainer:
             if self.cfg.amp and isinstance(self.optimizer, tf.keras.optimizers.Optimizer):
                 self.optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.optimizer)
             self.loss_fn = E2ELoss(self.model, hyp=self.hyp)
+            self.model.criterion = self.loss_fn
             self.ema = ModelEMA(self.model) if self.cfg.ema else None
             self.accum_grads = [tf.Variable(tf.zeros_like(v), trainable=False) for v in self.model.trainable_variables]
             self._build_optimizer_slots()
@@ -408,6 +411,26 @@ class YOLO26Trainer:
     def _load_resume_training_state(self):
         self._load_optimizer_state()
         self._load_ema_state()
+
+    def _set_class_weights(self, train_ds: YOLODataset):
+        """Compute Ultralytics-style inverse-frequency class weights when requested."""
+        self.model.nc = self.data["nc"]
+        self.model.names = self.data.get("names", getattr(self.model, "names", {}))
+        self.model.args = self.cfg
+        self.model.task = "detect"
+        if self.cfg.cls_pw <= 0:
+            return
+        if not 0 <= self.cfg.cls_pw <= 1.0:
+            raise AssertionError("cls_pw must be in the range [0, 1]")
+        classes = [lb["cls"].reshape(-1) for lb in train_ds.labels if len(lb.get("cls", []))]
+        if not classes:
+            return
+        counts = np.bincount(np.concatenate(classes).astype(np.int64), minlength=self.data["nc"]).astype(np.float32)
+        counts = np.where(counts == 0, 1.0, counts)
+        weights = (1.0 / counts) ** float(self.cfg.cls_pw)
+        weights = weights / weights.mean()
+        self.hyp["class_weights"] = weights.astype(np.float32)
+        self.model.class_weights = self.hyp["class_weights"]
 
     def _recover_from_nan(self, epoch: int) -> bool:
         """Restore the last checkpoint after non-finite loss, matching Ultralytics recovery intent."""
