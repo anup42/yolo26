@@ -71,7 +71,7 @@ class TrainConfig:
     save_period: int = -1
     log_interval: int = 10
     cls_pw: float = 0.0
-    compile_train_step: bool = True
+    compile_train_step: bool = False
     fast_data: bool = True
     fast_nms: bool = True
     profile_speed: bool = True
@@ -187,6 +187,21 @@ class YOLO26Trainer:
             f"batch={self.cfg.batch}, replicas={self.replicas}, xla_jit={tf.config.optimizer.get_jit()}",
             flush=True,
         )
+        print(
+            "training runtime: "
+            f"compile_train_step={self.cfg.compile_train_step}, amp={self.cfg.amp}, "
+            f"fast_data={self.cfg.fast_data}, use_tfrecord={self.cfg.use_tfrecord}, "
+            f"cache_images={self.cfg.cache_images}, fast_nms={self.cfg.fast_nms}, "
+            f"profile_speed={self.cfg.profile_speed}",
+            flush=True,
+        )
+        if self.cfg.compile_train_step:
+            print(
+                "warning: compiled train step is experimental on TensorFlow GPU; "
+                "CUDA illegal-address failures can corrupt the process and require restart. "
+                "Use --no-compile for stable training.",
+                flush=True,
+            )
         train_ds = YOLODataset(
             self.data,
             "train",

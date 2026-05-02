@@ -48,3 +48,24 @@ def test_tiny_training_eager_fallback_path(tmp_path):
         fast_data=False,
     )
     assert Path(result["last"]).exists()
+
+
+def test_tiny_training_compiled_opt_in_path(tmp_path):
+    data = create_tiny_dataset(tmp_path / "tiny_compile", n=2, size=32)
+    y = YOLO26("yolo26n.yaml", nc=1, imgsz=32)
+    result = y.train(
+        data=data,
+        epochs=1,
+        imgsz=32,
+        batch=1,
+        project=tmp_path / "runs",
+        name="compiled",
+        mosaic=0.0,
+        mixup=0.0,
+        cutmix=0.0,
+        optimizer="adamw",
+        lr0=1e-4,
+        compile_train_step=True,
+        fast_data=False,
+    )
+    assert Path(result["last"]).exists()

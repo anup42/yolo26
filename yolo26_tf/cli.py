@@ -52,7 +52,7 @@ def add_train_args(parser):
     parser.add_argument("--val-coco", action="store_true")
     parser.add_argument("--save-period", type=int, default=-1)
     parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--compile", dest="compile_train_step", action="store_true", default=True)
+    parser.add_argument("--compile", dest="compile_train_step", action="store_true", default=False, help="Experimental: compile forward/loss/gradient step with tf.function.")
     parser.add_argument("--no-compile", dest="compile_train_step", action="store_false")
     parser.add_argument("--fast-data", dest="fast_data", action="store_true", default=True)
     parser.add_argument("--no-fast-data", dest="fast_data", action="store_false")

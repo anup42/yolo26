@@ -1,10 +1,12 @@
 import json
+import argparse
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
 from yolo26_tf.coco import convert_coco_json_to_yolo, write_coco_yaml
+from yolo26_tf.cli import add_train_args
 from yolo26_tf.data import YOLODataset, load_data_yaml
 from yolo26_tf.tfrecord import load_yolo_tfrecord, write_yolo_tfrecord
 from yolo26_tf.trainer import TrainConfig
@@ -68,6 +70,7 @@ def test_tfrecord_write_read_and_dataset_source(tmp_path):
 
 
 def test_train_config_exposes_coco_parity_knobs():
+    assert TrainConfig().compile_train_step is False
     cfg = TrainConfig(
         amp=True,
         multi_scale=0.5,
@@ -94,6 +97,21 @@ def test_train_config_exposes_coco_parity_knobs():
     assert cfg.fast_data is True
     assert cfg.fast_nms is True
     assert cfg.cache_images == "auto"
+
+
+def test_cli_and_full_coco_runner_compile_defaults_are_stable():
+    parser = argparse.ArgumentParser()
+    add_train_args(parser)
+    args = parser.parse_args(["--data", "data.yaml"])
+    assert args.compile_train_step is False
+    assert parser.parse_args(["--data", "data.yaml", "--compile"]).compile_train_step is True
+
+    script = Path("scripts/train_coco_yolo26n_linux.sh").read_text(encoding="utf-8")
+    readme = Path("README.md").read_text(encoding="utf-8")
+    assert 'BATCH="${YOLO26_COCO_BATCH:-48}"' in script
+    assert 'COMPILE_STEP="${YOLO26_COCO_COMPILE:-0}"' in script
+    assert "YOLO26_COCO_BATCH=48" in readme
+    assert "YOLO26_COCO_COMPILE=0" in readme
 
 
 def test_coco_validation_merges_native_and_coco_metrics(tmp_path, monkeypatch):
