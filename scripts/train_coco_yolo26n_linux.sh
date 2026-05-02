@@ -2,9 +2,8 @@
 # Create a Linux GPU TensorFlow environment, prepare COCO, train scratch YOLO26n,
 # validate with COCOeval, and export/reload TFLite.
 #
-# Default profile is a practical COCO-small smoke run.  Use
-#   YOLO26_COCO_PROFILE=full bash scripts/train_coco_yolo26n_linux.sh
-# for full COCO scratch training.
+# Default profile is full COCO scratch training with conservative GPU-stable
+# settings. Use YOLO26_COCO_PROFILE=small for a quick smoke run.
 
 set -euo pipefail
 
@@ -19,10 +18,10 @@ PYTHON_BIN="${PYTHON:-python3}"
 VENV_DIR="${YOLO26_COCO_VENV:-$ROOT_DIR/.venv-coco-train}"
 DATA_DIR="${YOLO26_COCO_DATA:-$ROOT_DIR/datasets/coco}"
 OUT_DIR="${YOLO26_COCO_OUT:-$ROOT_DIR/runs/train/yolo26n_tf_coco}"
-PROFILE="${YOLO26_COCO_PROFILE:-small}"
+PROFILE="${YOLO26_COCO_PROFILE:-full}"
 TENSORFLOW_PACKAGE="${YOLO26_COCO_TENSORFLOW:-tensorflow[and-cuda]==2.15.1}"
 NUMPY_PACKAGE="${YOLO26_COCO_NUMPY:-numpy>=1.23.5,<2.0}"
-BATCH="${YOLO26_COCO_BATCH:-48}"
+BATCH="${YOLO26_COCO_BATCH:-32}"
 IMGSZ="${YOLO26_COCO_IMGSZ:-640}"
 SUBSET="${YOLO26_COCO_SUBSET:-100}"
 VAL_SUBSET="${YOLO26_COCO_VAL_SUBSET:-100}"
@@ -34,6 +33,7 @@ CACHE_IMAGES="${YOLO26_COCO_CACHE_IMAGES:-auto}"
 CACHE_RAM_GB="${YOLO26_COCO_CACHE_RAM_GB:-32}"
 USE_TFRECORD="${YOLO26_COCO_USE_TFRECORD:-1}"
 COMPILE_STEP="${YOLO26_COCO_COMPILE:-0}"
+AMP="${YOLO26_COCO_AMP:-0}"
 FAST_DATA="${YOLO26_COCO_FAST_DATA:-1}"
 FAST_NMS="${YOLO26_COCO_FAST_NMS:-1}"
 PROFILE_SPEED="${YOLO26_COCO_PROFILE_SPEED:-1}"
@@ -176,9 +176,9 @@ python -m yolo26_tf.cli detect train \
   --cache \
   --cache-images "$CACHE_IMAGES" \
   --cache-ram-gb "$CACHE_RAM_GB" \
-  --amp \
   --require-gpu \
   --val-coco \
+  $([[ "$AMP" == "1" ]] && echo "--amp" || echo "--no-amp") \
   $([[ "$USE_TFRECORD" == "1" ]] && echo "--use-tfrecord" || echo "--no-tfrecord") \
   $([[ "$COMPILE_STEP" == "1" ]] && echo "--compile" || echo "--no-compile") \
   $([[ "$FAST_DATA" == "1" ]] && echo "--fast-data" || echo "--no-fast-data") \

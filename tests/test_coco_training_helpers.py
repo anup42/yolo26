@@ -99,18 +99,25 @@ def test_train_config_exposes_coco_parity_knobs():
     assert cfg.cache_images == "auto"
 
 
-def test_cli_and_full_coco_runner_compile_defaults_are_stable():
+def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     parser = argparse.ArgumentParser()
     add_train_args(parser)
     args = parser.parse_args(["--data", "data.yaml"])
     assert args.compile_train_step is False
+    assert args.amp is True
     assert parser.parse_args(["--data", "data.yaml", "--compile"]).compile_train_step is True
+    assert parser.parse_args(["--data", "data.yaml", "--no-amp"]).amp is False
 
     script = Path("scripts/train_coco_yolo26n_linux.sh").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
-    assert 'BATCH="${YOLO26_COCO_BATCH:-48}"' in script
+    assert 'PROFILE="${YOLO26_COCO_PROFILE:-full}"' in script
+    assert 'BATCH="${YOLO26_COCO_BATCH:-32}"' in script
+    assert 'AMP="${YOLO26_COCO_AMP:-0}"' in script
     assert 'COMPILE_STEP="${YOLO26_COCO_COMPILE:-0}"' in script
-    assert "YOLO26_COCO_BATCH=48" in readme
+    assert '[[ "$AMP" == "1" ]] && echo "--amp" || echo "--no-amp"' in script
+    assert "bash scripts/train_coco_yolo26n_linux.sh" in readme
+    assert "YOLO26_COCO_BATCH=32" in readme
+    assert "YOLO26_COCO_AMP=0" in readme
     assert "YOLO26_COCO_COMPILE=0" in readme
 
 

@@ -177,8 +177,14 @@ class YOLO26Trainer:
 
     def train(self) -> dict[str, Any]:
         set_seed(self.cfg.seed)
+        try:
+            tf.config.optimizer.set_jit(False)
+        except Exception:
+            pass
         if self.cfg.amp:
             tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        else:
+            tf.keras.mixed_precision.set_global_policy("float32")
         self._freeze_layers()
         self._prepare_tfrecords()
         self.args_file.write_text(json.dumps({"config": asdict(self.cfg), "hyp": self.hyp}, indent=2, default=str), encoding="utf-8")
@@ -190,9 +196,10 @@ class YOLO26Trainer:
         print(
             "training runtime: "
             f"compile_train_step={self.cfg.compile_train_step}, amp={self.cfg.amp}, "
+            f"mixed_precision_policy={tf.keras.mixed_precision.global_policy().name}, "
             f"fast_data={self.cfg.fast_data}, use_tfrecord={self.cfg.use_tfrecord}, "
             f"cache_images={self.cfg.cache_images}, fast_nms={self.cfg.fast_nms}, "
-            f"profile_speed={self.cfg.profile_speed}",
+            f"profile_speed={self.cfg.profile_speed}, gpu_memory_growth={gpu_memory_growth_status()}",
             flush=True,
         )
         if self.cfg.compile_train_step:
@@ -764,6 +771,22 @@ def unscale_grads(optimizer, grads):
     if hasattr(optimizer, "get_unscaled_gradients"):
         return optimizer.get_unscaled_gradients(grads)
     return grads
+
+
+def gpu_memory_growth_status() -> str:
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        if not gpus:
+            return "no_gpu"
+        states = []
+        for i, gpu in enumerate(gpus):
+            try:
+                states.append(f"GPU:{i}={tf.config.experimental.get_memory_growth(gpu)}")
+            except Exception:
+                states.append(f"GPU:{i}=unknown")
+        return ",".join(states)
+    except Exception:
+        return "unknown"
 
 
 def apply_decoupled_weight_decay(variables, lr: float, weight_decay: float):

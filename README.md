@@ -65,13 +65,13 @@ Notes:
 
 The TensorFlow training stack now includes the YOLO26n detection pieces needed for real scratch COCO runs: YOLO/COCO dataset loading, threaded label verification/cache metadata with hash/version checks, segment-aware labels, class filtering, `single_cls`, rectangular validation shapes, flat `batch_idx/cls/bboxes` targets, Ultralytics-style transform objects (`Instances`, `Compose`, `LetterBox`, `Mosaic`, `RandomPerspective`, `CopyPaste`, `MixUp`, `CutMix`, `Albumentations`, `RandomHSV`, `RandomFlip`, `Format`) wired through the trainer iterator, close-mosaic, multi-scale training, EMA, warmup/cosine LR, gradient clipping/accumulation, AMP, class-weight scaling, freeze/time controls, CSV/results logging, checkpoint resume, NaN checkpoint recovery, final best-checkpoint validation, COCOeval validation, and SavedModel/TFLite export/reload verification.
 
-Use the Linux GPU-only runner:
+Use the Linux GPU-only runner from the repo root. By default this starts full COCO scratch training with the stable RTX A6000 settings documented below:
 
 ```bash
 bash scripts/train_coco_yolo26n_linux.sh
 ```
 
-The default profile is a small COCO subset smoke run so the pipeline can be checked quickly:
+For a small COCO subset smoke run, override the profile:
 
 ```bash
 YOLO26_COCO_PROFILE=small \
@@ -84,29 +84,18 @@ bash scripts/train_coco_yolo26n_linux.sh
 The training runner now defaults to the fast path:
 
 - stable eager TensorFlow gradient step by default: `YOLO26_COCO_COMPILE=0`;
+- stable FP32 training by default: `YOLO26_COCO_AMP=0`;
 - parallel `tf.data` sample pipeline with prefetch: `YOLO26_COCO_FAST_DATA=1`;
 - TFRecord generation and training input when available: `YOLO26_COCO_USE_TFRECORD=1`;
 - bounded record/image RAM cache: `YOLO26_COCO_CACHE_IMAGES=auto`, `YOLO26_COCO_CACHE_RAM_GB=32`;
 - TensorFlow graph NMS during validation: `YOLO26_COCO_FAST_NMS=1`;
 - speed profiling in batch logs plus `results.csv`/`results.json`: `speed/data_ms_per_batch`, `speed/train_ms_per_batch`, `speed/images_per_sec`, and `speed/val_ms`.
 
-For a full scratch COCO training run:
+The default full scratch COCO command is:
 
 ```bash
 cd /home/anup/git/anup-code/yolo26
 
-YOLO26_COCO_PROFILE=full \
-YOLO26_COCO_EPOCHS_FULL=300 \
-YOLO26_COCO_BATCH=48 \
-YOLO26_COCO_IMGSZ=640 \
-YOLO26_COCO_USE_TFRECORD=1 \
-YOLO26_COCO_COMPILE=0 \
-YOLO26_COCO_FAST_DATA=1 \
-YOLO26_COCO_FAST_NMS=1 \
-YOLO26_COCO_PROFILE_SPEED=1 \
-YOLO26_COCO_CACHE_IMAGES=auto \
-YOLO26_COCO_CACHE_RAM_GB=32 \
-YOLO26_COCO_NUMPY='numpy>=1.23.5,<2.0' \
 bash scripts/train_coco_yolo26n_linux.sh
 ```
 
@@ -116,7 +105,7 @@ Training logs are streamed to:
 runs/train/yolo26n_tf_coco/train_coco_yolo26n.log
 ```
 
-`YOLO26_COCO_BATCH=48` is the stable starting point for an RTX A6000 48 GB run. After a stable run, try `64` or `96` based on actual memory use. Keep `YOLO26_COCO_COMPILE=0` for stable training; `YOLO26_COCO_COMPILE=1` is an experimental speed path that can trigger unrecoverable TensorFlow GPU CUDA faults on some systems. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
+`YOLO26_COCO_BATCH=32` and `YOLO26_COCO_AMP=0` are the stable starting point for an RTX A6000 48 GB run. After a stable run, tune in this order: try batch `48`, then `64`, then `YOLO26_COCO_AMP=1`. Keep `YOLO26_COCO_COMPILE=0` for stable training; `YOLO26_COCO_COMPILE=1` is an experimental speed path that can trigger unrecoverable TensorFlow GPU CUDA faults on some systems. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
 
 The script:
 
