@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+import hashlib
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,6 +25,7 @@ from .tf_import import require_tf
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+DATASET_CACHE_VERSION = "yolo26_tf_0.2"
 
 
 def load_data_yaml(path: str | Path | dict) -> dict[str, Any]:
@@ -82,6 +84,21 @@ def list_images(path: str | Path | Iterable[str | Path]) -> list[Path]:
     return sorted(p for p in path.rglob("*") if p.suffix.lower() in IMG_EXTS)
 
 
+def get_hash(paths: Iterable[str | Path]) -> str:
+    """Hash image/label paths plus file metadata, matching Ultralytics cache invalidation intent."""
+    h = hashlib.sha256()
+    for p in sorted(str(Path(x)) for x in paths):
+        path = Path(p)
+        h.update(p.encode())
+        try:
+            stat = path.stat()
+            h.update(str(stat.st_size).encode())
+            h.update(str(int(stat.st_mtime)).encode())
+        except OSError:
+            h.update(b"missing")
+    return h.hexdigest()
+
+
 def img2label_path(img: Path) -> Path:
     parts = list(img.parts)
     try:
@@ -105,7 +122,17 @@ def verify_image_label(img: Path, nc: int | None = None) -> dict[str, Any]:
         return {"im_file": str(img), "shape": (0, 0), "cls": np.zeros((0,), np.int64), "bboxes": np.zeros((0, 4), np.float32), "ok": False, "msg": str(exc)}
 
     cls, boxes, msg = read_label_file(img2label_path(img), nc=nc)
-    return {"im_file": str(img), "shape": shape, "cls": cls, "bboxes": boxes, "ok": True, "msg": msg}
+    return {
+        "im_file": str(img),
+        "shape": shape,
+        "cls": cls,
+        "bboxes": boxes,
+        "segments": [],
+        "normalized": True,
+        "bbox_format": "xywh",
+        "ok": True,
+        "msg": msg,
+    }
 
 
 def read_label_file(path: Path, nc: int | None = None) -> tuple[np.ndarray, np.ndarray, str]:
@@ -158,6 +185,8 @@ class YOLODataset:
         fraction: float = 1.0,
         seed: int = 0,
         drop_last: bool = False,
+        classes: list[int] | tuple[int, ...] | None = None,
+        single_cls: bool = False,
     ):
         self.data = load_data_yaml(data)
         self.split = split
@@ -170,6 +199,8 @@ class YOLODataset:
         self.fraction = float(fraction)
         self.seed = int(seed)
         self.drop_last = bool(drop_last)
+        self.classes = None if classes is None else np.asarray(classes, dtype=np.int64).reshape(1, -1)
+        self.single_cls = bool(single_cls)
         self.rng = random.Random(self.seed)
         self.hyp = {
             "hsv_h": 0.015,
@@ -198,15 +229,23 @@ class YOLODataset:
         if 0 < self.fraction < 1:
             n = max(1, int(round(len(self.im_files) * self.fraction)))
             self.im_files = self.im_files[:n]
+        self.label_files = [img2label_path(p) for p in self.im_files]
         self.labels = self._load_or_build_cache() if cache else [verify_image_label(p, self.data["nc"]) for p in self.im_files]
         ok = [i for i, x in enumerate(self.labels) if x.get("ok", False)]
         self.im_files = [self.im_files[i] for i in ok]
+        self.label_files = [self.label_files[i] for i in ok]
         self.labels = [self.labels[i] for i in ok]
+        self._filter_labels()
         if self.rect:
             order = sorted(range(len(self.im_files)), key=lambda i: self.labels[i]["shape"][0] / max(self.labels[i]["shape"][1], 1))
             self.im_files = [self.im_files[i] for i in order]
+            self.label_files = [self.label_files[i] for i in order]
             self.labels = [self.labels[i] for i in order]
         self.indices = list(range(len(self.im_files)))
+        if self.rect:
+            self.batch_shapes = self._build_rect_batch_shapes()
+        else:
+            self.batch_shapes = None
         self.on_epoch_end()
 
     def __len__(self):
@@ -224,6 +263,10 @@ class YOLODataset:
         if cache_file.exists() and self.cache != "refresh":
             try:
                 raw = json.loads(cache_file.read_text(encoding="utf-8"))
+                if raw.get("version") != DATASET_CACHE_VERSION:
+                    raise AssertionError("cache version mismatch")
+                if raw.get("hash") != get_hash(list(self.im_files) + list(self.label_files)):
+                    raise AssertionError("cache hash mismatch")
                 by_file = {x["im_file"]: x for x in raw.get("labels", [])}
                 labels = []
                 for p in self.im_files:
@@ -236,6 +279,9 @@ class YOLODataset:
                             "shape": tuple(item["shape"]),
                             "cls": np.asarray(item["cls"], dtype=np.int64),
                             "bboxes": np.asarray(item["bboxes"], dtype=np.float32),
+                            "segments": item.get("segments", []),
+                            "normalized": bool(item.get("normalized", True)),
+                            "bbox_format": item.get("bbox_format", "xywh"),
                             "ok": bool(item["ok"]),
                             "msg": item.get("msg", ""),
                         }
@@ -248,11 +294,63 @@ class YOLODataset:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             serial = []
             for x in labels:
-                serial.append({**x, "shape": list(x["shape"]), "cls": x["cls"].tolist(), "bboxes": x["bboxes"].tolist()})
-            cache_file.write_text(json.dumps({"labels": serial}), encoding="utf-8")
+                serial.append(
+                    {
+                        **x,
+                        "shape": list(x["shape"]),
+                        "cls": x["cls"].tolist(),
+                        "bboxes": x["bboxes"].tolist(),
+                        "segments": [],
+                    }
+                )
+            payload = {
+                "version": DATASET_CACHE_VERSION,
+                "hash": get_hash(list(self.im_files) + list(self.label_files)),
+                "results": self._cache_results(labels),
+                "labels": serial,
+            }
+            cache_file.write_text(json.dumps(payload), encoding="utf-8")
         except Exception:
             pass
         return labels
+
+    def _cache_results(self, labels):
+        found = sum(1 for x in labels if len(x.get("cls", [])))
+        empty = sum(1 for x in labels if x.get("ok") and not len(x.get("cls", [])))
+        corrupt = sum(1 for x in labels if not x.get("ok"))
+        missing = sum(1 for x in labels if x.get("msg") == "empty")
+        return {"found": found, "missing": missing, "empty": empty, "corrupt": corrupt, "total": len(labels)}
+
+    def _filter_labels(self):
+        for label in self.labels:
+            cls = label["cls"].reshape(-1)
+            boxes = label["bboxes"].reshape(-1, 4)
+            if self.classes is not None and len(cls):
+                keep = (cls.reshape(-1, 1) == self.classes).any(axis=1)
+                cls, boxes = cls[keep], boxes[keep]
+            if self.single_cls and len(cls):
+                cls = np.zeros_like(cls)
+            label["cls"] = cls.astype(np.int64)
+            label["bboxes"] = boxes.astype(np.float32)
+
+    def _build_rect_batch_shapes(self, stride: int = 32, pad: float = 0.5):
+        shapes = np.asarray([x["shape"] for x in self.labels], dtype=np.float32)  # h, w
+        aspect = shapes[:, 1] / np.maximum(shapes[:, 0], 1.0)
+        batch_shapes = []
+        for bi in range(self.__len__()):
+            inds = self.indices[bi * self.batch : (bi + 1) * self.batch]
+            if not inds:
+                continue
+            ar = aspect[inds]
+            mini, maxi = ar.min(), ar.max()
+            if maxi < 1:
+                shape = [maxi, 1.0]
+            elif mini > 1:
+                shape = [1.0, 1.0 / mini]
+            else:
+                shape = [1.0, 1.0]
+            batch_shapes.append(np.ceil(np.asarray(shape) * self.imgsz / stride + pad).astype(int) * stride)
+        return np.asarray(batch_shapes, dtype=np.int32)
 
     def on_epoch_end(self):
         if self.shuffle and not self.rect:
@@ -267,14 +365,16 @@ class YOLODataset:
         cls, boxes, _ = read_label_file(img2label_path(path), nc=self.data.get("nc"))
         return cls, boxes
 
-    def load_one(self, idx: int):
+    def load_one(self, idx: int, rect_shape: tuple[int, int] | None = None):
         path = self.im_files[idx]
         img0 = np.asarray(Image.open(path).convert("RGB"))
         h0, w0 = img0.shape[:2]
         label = self.labels[idx]
         cls = label["cls"].copy()
         boxes = label["bboxes"].copy()
-        img, ratio, pad = letterbox(img0, self.imgsz, scaleup=self.augment)
+        new_shape = tuple(int(x) for x in rect_shape) if rect_shape is not None else self.imgsz
+        img, ratio, pad = letterbox(img0, new_shape, scaleup=self.augment)
+        out_h, out_w = img.shape[:2]
         if len(boxes):
             xyxy = xywh2xyxy_np(boxes)
             xyxy[:, [0, 2]] *= w0
@@ -282,8 +382,8 @@ class YOLODataset:
             xyxy[:, [0, 2]] = xyxy[:, [0, 2]] * ratio[0] + pad[0]
             xyxy[:, [1, 3]] = xyxy[:, [1, 3]] * ratio[1] + pad[1]
             boxes = xyxy2xywh_np(xyxy)
-            boxes[:, [0, 2]] /= self.imgsz
-            boxes[:, [1, 3]] /= self.imgsz
+            boxes[:, [0, 2]] /= out_w
+            boxes[:, [1, 3]] /= out_h
             boxes = boxes.clip(0, 1)
         return img, boxes.astype(np.float32), cls.astype(np.int64), str(path), (h0, w0), ratio, pad
 
@@ -350,8 +450,11 @@ class YOLODataset:
             )
         return img, boxes, cls, path, shape, ratio, pad
 
-    def get(self, idx: int):
-        img, boxes, cls, path, shape, ratio, pad = self.pre_aug_sample(idx)
+    def get(self, idx: int, rect_shape: tuple[int, int] | None = None):
+        if self.rect and rect_shape is not None:
+            img, boxes, cls, path, shape, ratio, pad = self.load_one(idx, rect_shape=rect_shape)
+        else:
+            img, boxes, cls, path, shape, ratio, pad = self.pre_aug_sample(idx)
         if self.augment:
             img, boxes, cls = copy_paste_bbox_only(img, boxes, cls, self.hyp.get("copy_paste", 0.0))
         if self.augment and self.rng.random() < self.hyp.get("mixup", 0.0):
@@ -377,7 +480,8 @@ class YOLODataset:
         batch_ids = self.indices[bi * self.batch : (bi + 1) * self.batch]
         if self.drop_last and len(batch_ids) < self.batch:
             raise IndexError(bi)
-        samples = [self.get(i) for i in batch_ids]
+        rect_shape = tuple(self.batch_shapes[bi]) if self.batch_shapes is not None and bi < len(self.batch_shapes) else None
+        samples = [self.get(i, rect_shape=rect_shape) for i in batch_ids]
         imgs = np.stack([s[0] for s in samples], axis=0)
         max_boxes = max([len(s[1]) for s in samples] + [1])
         bboxes = np.zeros((len(samples), max_boxes, 4), dtype=np.float32)
@@ -389,11 +493,21 @@ class YOLODataset:
                 bboxes[i, :n] = boxes_i
                 cls[i, :n] = cls_i
                 mask[i, :n] = True
+        flat_batch_idx, flat_cls, flat_boxes = [], [], []
+        for i in range(len(samples)):
+            valid = mask[i]
+            if valid.any():
+                flat_batch_idx.append(np.full((int(valid.sum()), 1), i, dtype=np.float32))
+                flat_cls.append(cls[i, valid, None].astype(np.float32))
+                flat_boxes.append(bboxes[i, valid].astype(np.float32))
         return {
             "img": imgs,
             "bboxes": bboxes,
             "cls": cls,
             "mask": mask,
+            "batch_idx": np.concatenate(flat_batch_idx, axis=0) if flat_batch_idx else np.zeros((0, 1), dtype=np.float32),
+            "flat_cls": np.concatenate(flat_cls, axis=0) if flat_cls else np.zeros((0, 1), dtype=np.float32),
+            "flat_bboxes": np.concatenate(flat_boxes, axis=0) if flat_boxes else np.zeros((0, 4), dtype=np.float32),
             "im_file": [s[3] for s in samples],
             "ori_shape": [s[4] for s in samples],
             "ratio": [s[5] for s in samples],
@@ -402,7 +516,15 @@ class YOLODataset:
 
     def numeric_batches(self):
         for b in self:
-            yield {"img": b["img"], "bboxes": b["bboxes"], "cls": b["cls"], "mask": b["mask"]}
+            yield {
+                "img": b["img"],
+                "bboxes": b["bboxes"],
+                "cls": b["cls"],
+                "mask": b["mask"],
+                "batch_idx": b["batch_idx"],
+                "flat_cls": b["flat_cls"],
+                "flat_bboxes": b["flat_bboxes"],
+            }
 
     def as_tf_dataset(self, prefetch: int = 2):
         tf = require_tf()
@@ -411,6 +533,9 @@ class YOLODataset:
             "bboxes": tf.TensorSpec(shape=(None, None, 4), dtype=tf.float32),
             "cls": tf.TensorSpec(shape=(None, None), dtype=tf.int64),
             "mask": tf.TensorSpec(shape=(None, None), dtype=tf.bool),
+            "batch_idx": tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
+            "flat_cls": tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
+            "flat_bboxes": tf.TensorSpec(shape=(None, 4), dtype=tf.float32),
         }
         ds = tf.data.Dataset.from_generator(self.numeric_batches, output_signature=signature)
         return ds.prefetch(prefetch)

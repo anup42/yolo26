@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from yolo26_tf.converter import convert_pt_to_tf, parity_check
-from yolo26_tf.losses import TaskAlignedAssigner
+from yolo26_tf.losses import BboxLoss, TaskAlignedAssigner
 
 
 def check_forward(weights: Path, imgsz: int, nc: int) -> dict:
@@ -57,6 +57,52 @@ def check_assigner() -> dict:
     }
 
 
+def check_bbox_loss() -> dict:
+    import torch
+    from ultralytics.utils.loss import BboxLoss as TorchBboxLoss
+
+    pred_dist = np.array([[[1.0, 1.1, 1.2, 1.3], [0.5, 0.5, 1.0, 1.0]]], dtype=np.float32)
+    pred_bboxes = np.array([[[4.0, 4.0, 8.0, 8.0], [10.0, 10.0, 13.0, 13.0]]], dtype=np.float32)
+    anchor_points = np.array([[6.0, 6.0], [11.0, 11.0]], dtype=np.float32)
+    target_bboxes_pixel = np.array([[[33.6, 32.8, 64.8, 65.6], [80.0, 80.0, 100.0, 102.4]]], dtype=np.float32)
+    stride = np.array([[8.0], [8.0]], dtype=np.float32)
+    target_bboxes_grid = target_bboxes_pixel / stride[None]
+    target_scores = np.array([[[0.7, 0.0], [0.0, 0.5]]], dtype=np.float32)
+    fg_mask = np.array([[True, True]])
+    target_scores_sum = np.array(1.2, dtype=np.float32)
+    imgsz = np.array([64.0, 64.0], dtype=np.float32)
+
+    torch_loss = TorchBboxLoss(reg_max=1)
+    torch_box, torch_dfl = torch_loss(
+        torch.tensor(pred_dist),
+        torch.tensor(pred_bboxes),
+        torch.tensor(anchor_points),
+        torch.tensor(target_bboxes_grid),
+        torch.tensor(target_scores),
+        torch.tensor(target_scores_sum),
+        torch.tensor(fg_mask),
+        torch.tensor(imgsz),
+        torch.tensor(stride),
+    )
+
+    tf_box, tf_dfl = BboxLoss(reg_max=1)(
+        pred_dist,
+        pred_bboxes,
+        anchor_points,
+        target_bboxes_pixel,
+        target_scores,
+        target_scores_sum,
+        fg_mask,
+        imgsz,
+        stride,
+    )
+    return {
+        "check": "bbox_loss",
+        "box_abs_diff": float(abs(float(tf_box.numpy()) - float(torch_box.numpy()))),
+        "dfl_abs_diff": float(abs(float(tf_dfl.numpy()) - float(torch_dfl.numpy()))),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run PyTorch-vs-TensorFlow YOLO26 parity checks.")
     parser.add_argument("--weights", default="yolo26n.pt")
@@ -64,19 +110,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nc", type=int, default=80)
     parser.add_argument("--forward", action="store_true")
     parser.add_argument("--assigner", action="store_true")
+    parser.add_argument("--bbox-loss", action="store_true")
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    run_forward = args.forward or not (args.forward or args.assigner)
-    run_assigner = args.assigner or not (args.forward or args.assigner)
+    run_forward = args.forward or not (args.forward or args.assigner or args.bbox_loss)
+    run_assigner = args.assigner or not (args.forward or args.assigner or args.bbox_loss)
+    run_bbox_loss = args.bbox_loss or not (args.forward or args.assigner or args.bbox_loss)
     results = []
     if run_forward:
         results.append(check_forward(Path(args.weights), args.imgsz, args.nc))
     if run_assigner:
         results.append(check_assigner())
+    if run_bbox_loss:
+        results.append(check_bbox_loss())
     text = json.dumps({"results": results}, indent=2)
     print(text)
     if args.output:

@@ -264,6 +264,15 @@ class DetectionLoss:
         return tf.cond(tf.shape(targets)[0] == 0, no_targets, with_targets)
 
     def _targets_to_flat(self, batch):
+        if {"batch_idx", "flat_cls", "flat_bboxes"}.issubset(batch):
+            return tf.concat(
+                [
+                    tf.cast(batch["batch_idx"], tf.float32),
+                    tf.cast(batch["flat_cls"], tf.float32),
+                    tf.cast(batch["flat_bboxes"], tf.float32),
+                ],
+                axis=-1,
+            )
         bboxes = tf.cast(batch["bboxes"], tf.float32)
         cls = tf.cast(batch["cls"], tf.float32)
         mask = tf.cast(batch.get("mask", tf.reduce_sum(bboxes, axis=-1) > 0), tf.bool)

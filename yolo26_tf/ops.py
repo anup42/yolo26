@@ -168,14 +168,15 @@ def pairwise_iou_np(boxes1: np.ndarray, boxes2: np.ndarray, eps: float = 1e-7) -
     return inter / (a1 + a2 - inter + eps)
 
 
-def nms_numpy(pred: np.ndarray, conf: float = 0.25, iou: float = 0.45, max_det: int = 300) -> np.ndarray:
+def nms_numpy(pred: np.ndarray, conf: float = 0.25, iou: float = 0.45, max_det: int = 300, agnostic: bool = False) -> np.ndarray:
     """Simple class-aware NMS for predictions shaped [N, 6] = xyxy, conf, cls."""
     pred = pred[pred[:, 4] >= conf]
     if len(pred) == 0:
         return pred.reshape(0, 6)
     keep = []
-    for cls in np.unique(pred[:, 5].astype(int)):
-        det = pred[pred[:, 5].astype(int) == cls]
+    classes = [None] if agnostic else np.unique(pred[:, 5].astype(int)).tolist()
+    for cls in classes:
+        det = pred if cls is None else pred[pred[:, 5].astype(int) == cls]
         order = det[:, 4].argsort()[::-1]
         while order.size > 0 and len(keep) < max_det:
             idx = order[0]

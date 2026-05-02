@@ -12,7 +12,7 @@ tf = require_tf()
 
 
 class ServingModule(tf.Module):
-    def __init__(self, model):
+    def __init__(self, model, imgsz: int = 640, dynamic: bool = True):
         super().__init__()
         # Do not attach the Keras model as a trackable child. Keras 3 can keep
         # call metadata wrappers from training calls that break SavedModel object
@@ -20,7 +20,8 @@ class ServingModule(tf.Module):
         # for TensorFlow to capture the serving graph and weights.
         self.weights = list(model.weights)
 
-        @tf.function(input_signature=[tf.TensorSpec([None, None, None, 3], tf.float32, name="images")])
+        shape = [None, None, None, 3] if dynamic else [None, imgsz, imgsz, 3]
+        @tf.function(input_signature=[tf.TensorSpec(shape, tf.float32, name="images")])
         def serve(images):
             return {"detections": model(images, training=False)}
 
@@ -30,6 +31,8 @@ class ServingModule(tf.Module):
 def export_model(model, format: str = "keras", output: str | Path | None = None, imgsz: int = 640, **kwargs):
     fmt = format.lower()
     output = Path(output) if output else Path(f"yolo26n_{fmt}")
+    if kwargs.get("nms", False):
+        raise NotImplementedError("NMS-embedded export is not supported yet; YOLO26 e2e exports use top-k postprocess.")
     if fmt in {"keras", "h5"}:
         path = output if output.suffix else output.with_suffix(".keras")
         try:
@@ -46,7 +49,7 @@ def export_model(model, format: str = "keras", output: str | Path | None = None,
     if fmt in {"saved_model", "savedmodel"}:
         path = output if not output.suffix else output.with_suffix("")
         path.parent.mkdir(parents=True, exist_ok=True)
-        module = ServingModule(model)
+        module = ServingModule(model, imgsz=imgsz, dynamic=kwargs.get("dynamic", True))
         tf.saved_model.save(module, str(path), signatures={"serving_default": module.serve})
         write_metadata(path, model, fmt, imgsz, kwargs)
         return str(path)
@@ -79,9 +82,8 @@ def export_model(model, format: str = "keras", output: str | Path | None = None,
     if fmt == "pb":
         from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2  # type: ignore
 
-        func = tf.function(lambda x: model(x, training=False)).get_concrete_function(
-            tf.TensorSpec([None, imgsz, imgsz, 3], tf.float32)
-        )
+        shape = [None, None, None, 3] if kwargs.get("dynamic", False) else [None, imgsz, imgsz, 3]
+        func = tf.function(lambda x: model(x, training=False)).get_concrete_function(tf.TensorSpec(shape, tf.float32))
         frozen = convert_variables_to_constants_v2(func)
         path = output if output.suffix == ".pb" else output.with_suffix(".pb")
         tf.io.write_graph(frozen.graph, str(path.parent), path.name, as_text=False)
@@ -93,7 +95,8 @@ def export_model(model, format: str = "keras", output: str | Path | None = None,
         except Exception as exc:
             raise ImportError("ONNX export requires `pip install tf2onnx`.") from exc
         path = output if output.suffix == ".onnx" else output.with_suffix(".onnx")
-        spec = (tf.TensorSpec([None, imgsz, imgsz, 3], tf.float32, name="images"),)
+        shape = [None, None, None, 3] if kwargs.get("dynamic", False) else [None, imgsz, imgsz, 3]
+        spec = (tf.TensorSpec(shape, tf.float32, name="images"),)
         import tf2onnx
 
         tf2onnx.convert.from_keras(model, input_signature=spec, output_path=str(path), opset=13)

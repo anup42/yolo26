@@ -6,6 +6,7 @@ import json
 import math
 import random
 import time
+import csv
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,10 @@ class TrainConfig:
     workers: int = 8
     gpus: str | None = None
     require_gpu: bool = False
+    classes: list[int] | None = None
+    single_cls: bool = False
+    freeze: int | list[int] = 0
+    time: float = 0.0
     clip_grad: float = 10.0
     val: bool = True
     val_coco: bool = False
@@ -103,6 +108,8 @@ class YOLO26Trainer:
         self.state_file = self.weights_dir / "trainer_state.json"
         self.optimizer_state = self.weights_dir / "optimizer_state.npz"
         self.ema_state = self.weights_dir / "ema_state.npz"
+        self.args_file = self.save_dir / "args.json"
+        self.csv_file = self.save_dir / "results.csv"
         self.best_fitness = -float("inf")
         self.start_epoch = 0
         self.history: list[dict[str, Any]] = []
@@ -115,6 +122,7 @@ class YOLO26Trainer:
         self.accum_counter = 0
         self.total_iterations = 1
         self.bias_lr = self.cfg.lr0
+        self.train_time_start = 0.0
 
     def _make_strategy(self):
         gpus = tf.config.list_physical_devices("GPU")
@@ -154,6 +162,8 @@ class YOLO26Trainer:
         set_seed(self.cfg.seed)
         if self.cfg.amp:
             tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        self._freeze_layers()
+        self.args_file.write_text(json.dumps({"config": asdict(self.cfg), "hyp": self.hyp}, indent=2, default=str), encoding="utf-8")
         print(
             f"Starting YOLO26 training: epochs={self.cfg.epochs}, imgsz={self.cfg.imgsz}, "
             f"batch={self.cfg.batch}, replicas={self.replicas}, xla_jit={tf.config.optimizer.get_jit()}",
@@ -167,10 +177,13 @@ class YOLO26Trainer:
             augment=True,
             hyp=self.hyp,
             shuffle=True,
+            rect=self.cfg.rect,
             cache=self.cfg.cache,
             fraction=self.cfg.fraction,
             seed=self.cfg.seed,
             drop_last=self.replicas > 1,
+            classes=self.cfg.classes,
+            single_cls=self.cfg.single_cls,
         )
         if self.cfg.resume:
             self._load_resume_weights()
@@ -184,6 +197,8 @@ class YOLO26Trainer:
                 iterations=iterations,
                 nc=self.data.get("nc", 80),
             )
+            if (self.cfg.optimizer or "auto").lower() == "auto" and optimizer_name == "adamw":
+                self.cfg.warmup_bias_lr = 0.0
             self.optimizer = make_optimizer(
                 optimizer_name,
                 lr=lr0,
@@ -204,6 +219,7 @@ class YOLO26Trainer:
         nw = max(round(self.cfg.warmup_epochs * len(train_ds)), 100 if self.cfg.warmup_epochs > 0 else 0)
         accumulate = self.cfg.accumulate or max(round(self.cfg.nbs / max(self.cfg.batch, 1)), 1)
         patience_count = 0
+        self.train_time_start = time.time()
         for epoch in range(self.start_epoch, self.cfg.epochs):
             if self.cfg.close_mosaic and epoch == max(self.cfg.epochs - self.cfg.close_mosaic, 0):
                 train_ds.close_mosaic()
@@ -254,6 +270,7 @@ class YOLO26Trainer:
             }
             self.history.append(row)
             (self.save_dir / "results.json").write_text(json.dumps(self.history, indent=2), encoding="utf-8")
+            self._append_csv(row)
             print(
                 f"epoch {epoch + 1}/{self.cfg.epochs} box={row['box_loss']:.4f} cls={row['cls_loss']:.4f} "
                 f"dfl={row['dfl_loss']:.4f} fitness={fitness:.4f} lr={row['lr']:.6g}"
@@ -262,7 +279,11 @@ class YOLO26Trainer:
             if self.cfg.patience and patience_count >= self.cfg.patience:
                 print(f"early stopping: no fitness improvement for {self.cfg.patience} epochs")
                 break
-        return {"save_dir": str(self.save_dir), "best": str(self.best), "last": str(self.last), "history": self.history}
+            if self.cfg.time and (time.time() - self.train_time_start) > self.cfg.time * 3600:
+                print(f"timed stopping: reached {self.cfg.time} training hours")
+                break
+        final_metrics = self._final_eval() if self.cfg.val and self.best.exists() and self.data.get("val") else {}
+        return {"save_dir": str(self.save_dir), "best": str(self.best), "last": str(self.last), "history": self.history, "final_metrics": final_metrics}
 
     def _train_step(self, batch_tf: dict, accumulate: int, lr: float):
         batch_tf = to_tensor_batch(batch_tf)
@@ -347,6 +368,7 @@ class YOLO26Trainer:
                 project=self.save_dir,
                 name=f"val_epoch{epoch + 1}",
                 verbose=False,
+                single_cls=self.cfg.single_cls,
             )
         finally:
             if self.ema:
@@ -447,9 +469,57 @@ class YOLO26Trainer:
         except Exception:
             pass
 
+    def _freeze_layers(self):
+        freeze = self.cfg.freeze
+        if not freeze:
+            return
+        if isinstance(freeze, int):
+            freeze_ids = set(range(freeze))
+        else:
+            freeze_ids = {int(x) for x in freeze}
+        for i, layer in enumerate(getattr(self.model, "layers_seq", [])):
+            if i in freeze_ids:
+                layer.trainable = False
+                print(f"Freezing layer {i}: {layer.name}", flush=True)
+
+    def _append_csv(self, row: dict[str, Any]):
+        write_header = not self.csv_file.exists()
+        fields = list(row.keys())
+        with self.csv_file.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    def _final_eval(self) -> dict[str, Any]:
+        current = self.model.get_weights()
+        try:
+            self.model.load_weights(str(self.best))
+            metrics = validate_detection_model(
+                self.model,
+                self.data,
+                imgsz=self.cfg.imgsz,
+                batch=self.cfg.batch,
+                conf=self.cfg.val_conf,
+                iou=self.cfg.val_iou,
+                max_det=self.cfg.max_det,
+                rect=True,
+                use_coco=self.cfg.val_coco,
+                save_json=self.cfg.val_coco,
+                project=self.save_dir,
+                name="final_best_val",
+                verbose=False,
+                single_cls=self.cfg.single_cls,
+            )
+            (self.save_dir / "final_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            return metrics
+        finally:
+            self.model.set_weights(current)
+
 
 def to_tensor_batch(batch: dict) -> dict:
-    return {k: tf.convert_to_tensor(v) if k in {"img", "bboxes", "cls", "mask"} else v for k, v in batch.items()}
+    tensor_keys = {"img", "bboxes", "cls", "mask", "batch_idx", "flat_cls", "flat_bboxes"}
+    return {k: tf.convert_to_tensor(v) if k in tensor_keys else v for k, v in batch.items()}
 
 
 def multiscale_batch(batch: dict, base_imgsz: int, factor: float = 0.5, stride: int = 32) -> dict:

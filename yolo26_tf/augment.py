@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .instances import Instances
+from .ops import letterbox
 from .ops import xywh2xyxy_np, xyxy2xywh_np
 
 try:  # pragma: no cover - exercised when opencv is installed
@@ -272,3 +274,111 @@ def random_bgr(img: np.ndarray, p: float = 0.0) -> np.ndarray:
     if p and random.random() < p:
         return img[..., ::-1].copy()
     return img
+
+
+class Compose:
+    """Sequential transform container compatible with Ultralytics augmentation flow."""
+
+    def __init__(self, transforms):
+        self.transforms = list(transforms)
+
+    def append(self, transform):
+        self.transforms.append(transform)
+
+    def insert(self, index: int, transform):
+        self.transforms.insert(index, transform)
+
+    def __call__(self, labels):
+        for transform in self.transforms:
+            labels = transform(labels)
+        return labels
+
+
+class LetterBox:
+    """Label-aware letterbox transform mirroring Ultralytics detection behavior."""
+
+    def __init__(self, new_shape=(640, 640), scaleup=True, center=True, stride=32, padding_value=114):
+        self.new_shape = new_shape
+        self.scaleup = scaleup
+        self.center = center
+        self.stride = stride
+        self.padding_value = padding_value
+
+    def __call__(self, labels=None, image=None):
+        labels = {} if labels is None else labels
+        img = labels.get("img") if image is None else image
+        img, ratio, pad = letterbox(img, self.new_shape, color=(self.padding_value,) * 3, scaleup=self.scaleup)
+        if not self.center and pad != (0, 0):
+            # The port currently only needs centered letterbox for YOLO26 train/val.
+            raise NotImplementedError("LetterBox(center=False) is not supported in yolo26_tf.")
+        if not labels:
+            return img
+        if "instances" in labels:
+            inst = labels["instances"]
+            inst.convert_bbox("xyxy")
+            inst.denormalize(*labels["img"].shape[:2][::-1])
+            inst.scale(*ratio)
+            inst.add_padding(*pad)
+        labels["img"] = img
+        labels["ratio_pad"] = (ratio, pad)
+        labels["resized_shape"] = img.shape[:2]
+        return labels
+
+
+class Format:
+    """Format labels into the TensorFlow port's normalized HWC detection contract."""
+
+    def __init__(self, bbox_format="xywh", normalize=True, batch_idx=True, bgr=0.0):
+        self.bbox_format = bbox_format
+        self.normalize = bool(normalize)
+        self.batch_idx = bool(batch_idx)
+        self.bgr = float(bgr)
+
+    def __call__(self, labels):
+        img = random_bgr(labels["img"], self.bgr)
+        instances = labels.get("instances")
+        if instances is None:
+            instances = Instances(labels.get("bboxes", np.zeros((0, 4), dtype=np.float32)), bbox_format="xywh", normalized=True)
+        h, w = img.shape[:2]
+        instances.convert_bbox(self.bbox_format)
+        if self.normalize:
+            instances.normalize(w, h)
+        labels["img"] = img.astype(np.float32) / 255.0
+        labels["bboxes"] = instances.bboxes.astype(np.float32)
+        labels["cls"] = np.asarray(labels.get("cls", np.zeros((len(instances),), dtype=np.int64))).reshape(-1).astype(np.int64)
+        if self.batch_idx:
+            labels["batch_idx"] = np.zeros((len(instances), 1), dtype=np.float32)
+        return labels
+
+
+def copy_paste_segments(img, instances: Instances, cls: np.ndarray, p: float = 0.0):
+    """Segment-aware CopyPaste flip mode for detection labels with available segments."""
+    if p <= 0 or len(instances) == 0 or not len(instances.segments):
+        return img, instances, cls
+    h, w = img.shape[:2]
+    inst = Instances(instances.bboxes.copy(), instances.segments.copy(), bbox_format=instances.bbox_format, normalized=instances.normalized)
+    inst.convert_bbox("xyxy")
+    inst.denormalize(w, h)
+    flipped = Instances(inst.bboxes.copy(), inst.segments.copy(), bbox_format="xyxy", normalized=False)
+    flipped.fliplr(w)
+    ioa = bbox_ioa(flipped.bboxes, inst.bboxes)
+    indexes = np.nonzero((ioa < 0.30).all(axis=1))[0]
+    if not len(indexes):
+        return img, instances, cls
+    n = round(p * len(indexes))
+    if n <= 0:
+        return img, instances, cls
+    indexes = indexes[:n]
+    out = img.copy()
+    flipped_img = np.ascontiguousarray(np.fliplr(img))
+    mask = np.zeros(img.shape[:2], dtype=np.uint8)
+    cv = _require_cv2()
+    for j in indexes:
+        cv.drawContours(mask, flipped.segments[[j]].astype(np.int32), -1, 1, cv.FILLED)
+    mask_bool = mask.astype(bool)
+    out[mask_bool] = flipped_img[mask_bool]
+    merged = Instances.concatenate([inst, flipped[indexes]], axis=0)
+    merged.convert_bbox("xywh")
+    merged.normalize(w, h)
+    cls_out = np.concatenate([cls.reshape(-1), cls.reshape(-1)[indexes]], axis=0)
+    return out, merged, cls_out.astype(np.int64)

@@ -33,12 +33,26 @@ def test_coco_conversion_and_subset_dataset(tmp_path):
     batch = next(iter(ds))
     assert batch["img"].shape == (1, 64, 64, 3)
     assert batch["mask"].sum() == 1
+    assert batch["batch_idx"].shape == (1, 1)
+    assert batch["flat_cls"].shape == (1, 1)
+    assert batch["flat_bboxes"].shape == (1, 4)
+    cache_file = root / "train.labels.cache.json"
+    assert cache_file.exists()
+    cache = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert "hash" in cache and "version" in cache and "results" in cache
+
+    rect_ds = YOLODataset(data, "train", imgsz=64, batch=1, augment=False, shuffle=False, rect=True, classes=[0])
+    assert rect_ds.batch_shapes is not None
+    assert next(iter(rect_ds))["mask"].sum() == 1
 
 
 def test_train_config_exposes_coco_parity_knobs():
-    cfg = TrainConfig(amp=True, multi_scale=True, gpus="0,1", val_coco=True, require_gpu=True)
+    cfg = TrainConfig(amp=True, multi_scale=0.5, gpus="0,1", val_coco=True, require_gpu=True, single_cls=True, freeze=2, time=1.0)
     assert cfg.amp is True
-    assert cfg.multi_scale is True
+    assert cfg.multi_scale == 0.5
     assert cfg.gpus == "0,1"
     assert cfg.val_coco is True
     assert cfg.require_gpu is True
+    assert cfg.single_cls is True
+    assert cfg.freeze == 2
+    assert cfg.time == 1.0

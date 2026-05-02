@@ -63,7 +63,7 @@ Notes:
 
 ## COCO Scratch Training
 
-The TensorFlow training stack now includes the YOLO26n detection pieces needed for real scratch COCO runs: YOLO/COCO dataset loading, label verification/cache metadata, mosaic/random-perspective/mixup/cutmix/HSV/flips, close-mosaic, multi-scale training, EMA, warmup/cosine LR, gradient clipping/accumulation, AMP, checkpoint resume, COCOeval validation, and TFLite export/reload verification.
+The TensorFlow training stack now includes the YOLO26n detection pieces needed for real scratch COCO runs: YOLO/COCO dataset loading, label verification/cache metadata with hash/version checks, class filtering, `single_cls`, rectangular validation shapes, flat `batch_idx/cls/bboxes` targets, mosaic/random-perspective/mixup/cutmix/HSV/flips, close-mosaic, multi-scale training, EMA, warmup/cosine LR, gradient clipping/accumulation, AMP, freeze/time controls, CSV/results logging, checkpoint resume, final best-checkpoint validation, COCOeval validation, and TFLite export/reload verification.
 
 Use the Linux GPU-only runner:
 
@@ -119,5 +119,14 @@ It compares:
 
 - converted TensorFlow forward outputs against the upstream PyTorch checkpoint;
 - TensorFlow `TaskAlignedAssigner` behavior against Ultralytics for small-box and multi-GT conflict cases.
+- TensorFlow `BboxLoss(reg_max=1)` box and DFL/L1 terms against Ultralytics on a controlled synthetic batch.
 
-The automated test suite also includes these assigner parity checks when the optional upstream dependencies are available.
+Run individual checks when debugging:
+
+```bash
+python scripts/parity_check_yolo26.py --weights yolo26n.pt --imgsz 64 --forward
+python scripts/parity_check_yolo26.py --weights yolo26n.pt --imgsz 64 --assigner
+python scripts/parity_check_yolo26.py --weights yolo26n.pt --imgsz 64 --bbox-loss
+```
+
+The automated test suite also covers dataset cache/rectangular target behavior, AP50-95 metrics, confusion matrix accounting, tiny training, prediction, and TFLite export/reload smoke paths.

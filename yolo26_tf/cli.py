@@ -34,6 +34,10 @@ def add_train_args(parser):
     parser.add_argument("--cache", action="store_true")
     parser.add_argument("--rect", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--classes", default=None, help="Comma-separated class indexes to include.")
+    parser.add_argument("--single-cls", action="store_true")
+    parser.add_argument("--freeze", default=0, help="Number of leading layers or comma-separated layer indexes to freeze.")
+    parser.add_argument("--time", type=float, default=0.0, help="Maximum training time in hours.")
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.add_argument("--multi-scale", nargs="?", const=0.5, default=0.0, type=float)
@@ -79,6 +83,11 @@ def main(argv=None):
     val.add_argument("--max-det", type=int, default=300)
     val.add_argument("--coco", action="store_true")
     val.add_argument("--save-json", action="store_true")
+    val.add_argument("--save-txt", action="store_true")
+    val.add_argument("--save-conf", action="store_true")
+    val.add_argument("--single-cls", action="store_true")
+    val.add_argument("--agnostic-nms", action="store_true")
+    val.add_argument("--half", action="store_true")
     val.add_argument("--project", default="runs/detect")
     val.add_argument("--name", default="val")
 
@@ -101,6 +110,11 @@ def main(argv=None):
     exp.add_argument("--imgsz", type=int, default=640)
     exp.add_argument("--half", action="store_true")
     exp.add_argument("--int8", action="store_true")
+    exp.add_argument("--full-integer", action="store_true")
+    exp.add_argument("--dynamic", dest="dynamic", action="store_true", default=True)
+    exp.add_argument("--static", dest="dynamic", action="store_false")
+    exp.add_argument("--nms", action="store_true", help="Request NMS-embedded export; currently fails with a clear unsupported-option error.")
+    exp.add_argument("--no-verify", dest="verify", action="store_false", default=True)
 
     bench = detect_sub.add_parser("benchmark-coco")
     bench.add_argument("--model", default="yolo26n.yaml")
@@ -146,6 +160,10 @@ def main(argv=None):
             cache=args.cache,
             rect=args.rect,
             resume=args.resume,
+            classes=parse_int_list(args.classes),
+            single_cls=args.single_cls,
+            freeze=parse_freeze(args.freeze),
+            time=args.time,
             amp=args.amp,
             multi_scale=args.multi_scale,
             cos_lr=args.cos_lr,
@@ -173,7 +191,23 @@ def main(argv=None):
         y = YOLO26(args.model, nc=nc, imgsz=args.imgsz)
         if args.weights:
             y.model.load_weights(args.weights)
-        y.val(args.data, imgsz=args.imgsz, batch=args.batch, conf=args.conf, iou=args.iou, max_det=args.max_det, coco=args.coco, save_json=args.save_json, project=args.project, name=args.name)
+        y.val(
+            args.data,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            conf=args.conf,
+            iou=args.iou,
+            max_det=args.max_det,
+            coco=args.coco,
+            save_json=args.save_json,
+            save_txt=args.save_txt,
+            save_conf=args.save_conf,
+            single_cls=args.single_cls,
+            agnostic_nms=args.agnostic_nms,
+            half=args.half,
+            project=args.project,
+            name=args.name,
+        )
     elif args.mode == "benchmark-coco":
         model_ref = args.weights if str(args.weights).endswith(".pt") else args.model
         y = YOLO26(model_ref, imgsz=args.imgsz)
@@ -191,8 +225,35 @@ def main(argv=None):
         y = YOLO26(args.model, nc=args.nc, imgsz=args.imgsz)
         if args.weights:
             y.model.load_weights(args.weights)
-        print(y.export(format=args.format, output=args.output, imgsz=args.imgsz, half=args.half, int8=args.int8))
+        print(
+            y.export(
+                format=args.format,
+                output=args.output,
+                imgsz=args.imgsz,
+                half=args.half,
+                int8=args.int8,
+                full_integer=args.full_integer,
+                dynamic=args.dynamic,
+                nms=args.nms,
+                verify=args.verify,
+            )
+        )
     return 0
+
+
+def parse_int_list(value):
+    if value in (None, ""):
+        return None
+    return [int(x.strip()) for x in str(value).split(",") if x.strip()]
+
+
+def parse_freeze(value):
+    if value in (None, ""):
+        return 0
+    text = str(value)
+    if "," in text:
+        return [int(x.strip()) for x in text.split(",") if x.strip()]
+    return int(text)
 
 
 if __name__ == "__main__":
