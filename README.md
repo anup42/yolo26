@@ -93,12 +93,27 @@ The training runner now defaults to the fast path:
 For a full scratch COCO training run:
 
 ```bash
+cd /home/anup/git/anup-code/yolo26
+
 YOLO26_COCO_PROFILE=full \
 YOLO26_COCO_EPOCHS_FULL=300 \
 YOLO26_COCO_BATCH=96 \
 YOLO26_COCO_IMGSZ=640 \
+YOLO26_COCO_USE_TFRECORD=1 \
+YOLO26_COCO_COMPILE=1 \
+YOLO26_COCO_FAST_DATA=1 \
+YOLO26_COCO_FAST_NMS=1 \
+YOLO26_COCO_PROFILE_SPEED=1 \
+YOLO26_COCO_CACHE_IMAGES=auto \
+YOLO26_COCO_CACHE_RAM_GB=32 \
 YOLO26_COCO_NUMPY='numpy>=1.23.5,<2.0' \
 bash scripts/train_coco_yolo26n_linux.sh
+```
+
+Training logs are streamed to:
+
+```bash
+runs/train/yolo26n_tf_coco/train_coco_yolo26n.log
 ```
 
 `YOLO26_COCO_BATCH=96` is the recommended starting point for an RTX A6000 48 GB run. Increase or reduce it based on actual memory use. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
