@@ -34,8 +34,10 @@ def add_train_args(parser):
     parser.add_argument("--cache", action="store_true")
     parser.add_argument("--rect", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--amp", action="store_true")
-    parser.add_argument("--multi-scale", action="store_true")
+    parser.add_argument("--amp", dest="amp", action="store_true", default=True)
+    parser.add_argument("--no-amp", dest="amp", action="store_false")
+    parser.add_argument("--multi-scale", nargs="?", const=0.5, default=0.0, type=float)
+    parser.add_argument("--cos-lr", action="store_true")
     parser.add_argument("--require-gpu", action="store_true")
     parser.add_argument("--val-coco", action="store_true")
     parser.add_argument("--save-period", type=int, default=-1)
@@ -146,6 +148,7 @@ def main(argv=None):
             resume=args.resume,
             amp=args.amp,
             multi_scale=args.multi_scale,
+            cos_lr=args.cos_lr,
             require_gpu=args.require_gpu,
             val_coco=args.val_coco,
             save_period=args.save_period,

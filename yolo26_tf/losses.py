@@ -16,12 +16,22 @@ tf = require_tf()
 class TaskAlignedAssigner:
     """TensorFlow TaskAlignedAssigner for YOLO detection training."""
 
-    def __init__(self, topk: int = 10, num_classes: int = 80, alpha: float = 0.5, beta: float = 6.0, topk2: int | None = None):
+    def __init__(
+        self,
+        topk: int = 10,
+        num_classes: int = 80,
+        alpha: float = 0.5,
+        beta: float = 6.0,
+        stride: list[float] | None = None,
+        topk2: int | None = None,
+    ):
         self.topk = int(topk)
         self.topk2 = int(topk2 or topk)
         self.num_classes = int(num_classes)
         self.alpha = float(alpha)
         self.beta = float(beta)
+        self.stride = [float(x) for x in (stride or [8.0, 16.0, 32.0])]
+        self.stride_val = self.stride[1] if len(self.stride) > 1 else self.stride[0]
         self.eps = 1e-9
 
     def __call__(self, pd_scores, pd_bboxes, anchor_points, gt_labels, gt_bboxes, mask_gt):
@@ -36,8 +46,9 @@ class TaskAlignedAssigner:
         anchors_n = tf.shape(pd_scores)[1]
         max_gt = tf.shape(gt_bboxes)[1]
 
+        candidate_gt_bboxes = self._candidate_boxes(gt_bboxes, mask_gt)
         ap = anchor_points[None, None, :, :]
-        gtb = gt_bboxes[:, :, None, :]
+        gtb = candidate_gt_bboxes[:, :, None, :]
         in_gts = (
             (ap[..., 0] > gtb[..., 0])
             & (ap[..., 1] > gtb[..., 1])
@@ -75,8 +86,19 @@ class TaskAlignedAssigner:
         norm = selected_metric / (selected_metric_max + self.eps) * selected_iou_max
         norm = tf.where(fg_mask, tf.maximum(norm, self.eps), tf.zeros_like(norm))
         target_scores = tf.one_hot(target_labels, self.num_classes, dtype=tf.float32) * norm[..., None]
-        target_bboxes = tf.where(fg_mask[..., None], target_bboxes, tf.zeros_like(target_bboxes))
         return target_bboxes, target_scores, fg_mask, target_gt_idx
+
+    def _candidate_boxes(self, gt_bboxes, mask_gt):
+        """Match Ultralytics TAL small-box expansion before anchor-in-GT checks."""
+        x1, y1, x2, y2 = tf.split(gt_bboxes, 4, axis=-1)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        wh = tf.concat([x2 - x1, y2 - y1], axis=-1)
+        min_stride = tf.cast(self.stride[0], gt_bboxes.dtype)
+        stride_val = tf.cast(self.stride_val, gt_bboxes.dtype)
+        wh = tf.where((wh < min_stride) & mask_gt[..., None], stride_val, wh)
+        half = wh * 0.5
+        return tf.concat([cx - half[..., 0:1], cy - half[..., 1:2], cx + half[..., 0:1], cy + half[..., 1:2]], axis=-1)
 
     def _topk_mask(self, metric, topk: int):
         k = tf.minimum(tf.cast(topk, tf.int32), tf.shape(metric)[-1])
@@ -137,7 +159,7 @@ class DetectionLoss:
         self.nc = model.nc
         self.stride = list(model.stride)
         self.reg_max = int(model.detect_layer.reg_max)
-        self.assigner = TaskAlignedAssigner(tal_topk, self.nc, alpha=0.5, beta=6.0, topk2=tal_topk2)
+        self.assigner = TaskAlignedAssigner(tal_topk, self.nc, alpha=0.5, beta=6.0, stride=self.stride, topk2=tal_topk2)
         self.bbox_loss = BboxLoss(self.reg_max)
         self.hyp = {"box": 7.5, "cls": 0.5, "dfl": 1.5, "epochs": 100}
         if hyp:

@@ -40,8 +40,9 @@ class TrainConfig:
     accumulate: int = 0
     patience: int = 100
     close_mosaic: int = 10
-    multi_scale: bool = False
-    amp: bool = False
+    multi_scale: float = 0.0
+    amp: bool = True
+    cos_lr: bool = False
     ema: bool = True
     resume: bool = False
     seed: int = 0
@@ -173,13 +174,22 @@ class YOLO26Trainer:
         iterations = max(len(train_ds) * self.cfg.epochs, 1)
         self.total_iterations = iterations
         with self.strategy.scope():
-            self.optimizer = make_optimizer(
+            optimizer_name, lr0, momentum = resolve_optimizer_auto(
                 self.cfg.optimizer,
-                lr=self.cfg.lr0,
-                momentum=self.cfg.momentum,
+                self.cfg.lr0,
+                self.cfg.momentum,
+                iterations=iterations,
+                nc=self.data.get("nc", 80),
+            )
+            self.optimizer = make_optimizer(
+                optimizer_name,
+                lr=lr0,
+                momentum=momentum,
                 weight_decay=0.0,
                 iterations=iterations,
             )
+            self.cfg.lr0 = lr0
+            self.cfg.momentum = momentum
             if self.cfg.amp and isinstance(self.optimizer, tf.keras.optimizers.Optimizer):
                 self.optimizer = tf.keras.mixed_precision.LossScaleOptimizer(self.optimizer)
             self.loss_fn = E2ELoss(self.model, hyp=self.hyp)
@@ -250,8 +260,8 @@ class YOLO26Trainer:
 
     def _train_step(self, batch_tf: dict, accumulate: int, lr: float):
         batch_tf = to_tensor_batch(batch_tf)
-        if self.cfg.multi_scale:
-            batch_tf = multiscale_batch(batch_tf, self.cfg.imgsz)
+        if self.cfg.multi_scale > 0.0:
+            batch_tf = multiscale_batch(batch_tf, self.cfg.imgsz, factor=self.cfg.multi_scale)
         with tf.GradientTape() as tape:
             preds = self.model(batch_tf["img"], training=True)
             loss, loss_items = self.loss_fn(preds, batch_tf)
@@ -285,7 +295,10 @@ class YOLO26Trainer:
 
     def _set_lr_momentum(self, ni: int, nw: int) -> float:
         progress = min(max(ni / max(self.total_iterations, 1), 0.0), 1.0)
-        lf = self.cfg.lrf + 0.5 * (1.0 + math.cos(math.pi * progress)) * (1.0 - self.cfg.lrf)
+        if self.cfg.cos_lr:
+            lf = self.cfg.lrf + 0.5 * (1.0 + math.cos(math.pi * progress)) * (1.0 - self.cfg.lrf)
+        else:
+            lf = max(1.0 - progress, 0.0) * (1.0 - self.cfg.lrf) + self.cfg.lrf
         lr = self.cfg.lr0 * lf
         momentum = self.cfg.momentum
         if nw and ni <= nw:
@@ -353,15 +366,26 @@ def to_tensor_batch(batch: dict) -> dict:
     return {k: tf.convert_to_tensor(v) if k in {"img", "bboxes", "cls", "mask"} else v for k, v in batch.items()}
 
 
-def multiscale_batch(batch: dict, base_imgsz: int, stride: int = 32) -> dict:
-    low = max(stride, int(base_imgsz * 0.5) // stride * stride)
-    high = max(low, int(base_imgsz * 1.5) // stride * stride)
+def multiscale_batch(batch: dict, base_imgsz: int, factor: float = 0.5, stride: int = 32) -> dict:
+    factor = float(factor)
+    low = max(stride, int(base_imgsz * (1.0 - factor)) // stride * stride)
+    high = max(low, int(base_imgsz * (1.0 + factor)) // stride * stride)
     size = random.randrange(low, high + stride, stride)
     if int(batch["img"].shape[1]) == size:
         return batch
     out = dict(batch)
     out["img"] = tf.image.resize(batch["img"], [size, size], method="bilinear")
     return out
+
+
+def resolve_optimizer_auto(name: str, lr: float, momentum: float, iterations: int, nc: int) -> tuple[str, float, float]:
+    """Match Ultralytics optimizer=auto behavior for optimizer, lr0 and momentum."""
+    if (name or "auto").lower() != "auto":
+        return name, float(lr), float(momentum)
+    if iterations > 10000:
+        return "musgd", 0.01, 0.9
+    lr_fit = round(0.002 * 5 / (4 + int(nc)), 6)
+    return "adamw", lr_fit, 0.9
 
 
 def set_seed(seed: int):

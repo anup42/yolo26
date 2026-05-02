@@ -144,7 +144,7 @@ python -m yolo26_tf.cli detect train \
   --batch "$BATCH" \
   --project "$PROJECT" \
   --name "$NAME" \
-  --optimizer musgd \
+  --optimizer "${YOLO26_COCO_OPTIMIZER:-auto}" \
   --lr0 "${YOLO26_COCO_LR0:-0.01}" \
   --lrf "${YOLO26_COCO_LRF:-0.01}" \
   --momentum "${YOLO26_COCO_MOMENTUM:-0.937}" \
@@ -154,7 +154,6 @@ python -m yolo26_tf.cli detect train \
   --workers "${YOLO26_COCO_WORKERS:-4}" \
   --cache \
   --amp \
-  --multi-scale \
   --require-gpu \
   --val-coco
 
