@@ -1,11 +1,16 @@
 import json
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from yolo26_tf.coco import convert_coco_json_to_yolo, write_coco_yaml
 from yolo26_tf.data import YOLODataset, load_data_yaml
+from yolo26_tf.tfrecord import load_yolo_tfrecord, write_yolo_tfrecord
 from yolo26_tf.trainer import TrainConfig
+from yolo26_tf.validation import validate_detection_model
+
+tf = pytest.importorskip("tensorflow")
 
 
 def test_coco_conversion_and_subset_dataset(tmp_path):
@@ -46,8 +51,37 @@ def test_coco_conversion_and_subset_dataset(tmp_path):
     assert next(iter(rect_ds))["mask"].sum() == 1
 
 
+def test_tfrecord_write_read_and_dataset_source(tmp_path):
+    root = tmp_path / "tiny_tfrecord"
+    data_yaml = __import__("scripts.make_tiny_dataset", fromlist=["create_tiny_dataset"]).create_tiny_dataset(root, n=3, size=32)
+    record = root / "records" / "train.tfrecord"
+    stats = write_yolo_tfrecord(data_yaml, "train", record)
+    assert stats["images"] == 3
+    records = load_yolo_tfrecord(record)
+    assert len(records) == 3
+    data = load_data_yaml(data_yaml)
+    data["train_tfrecord"] = record
+    ds = YOLODataset(data, "train", imgsz=32, batch=2, augment=False, shuffle=False, use_tfrecord=True, cache_ram_gb=1)
+    batch = next(iter(ds))
+    assert batch["img"].shape == (2, 32, 32, 3)
+    assert batch["mask"].sum() == 2
+
+
 def test_train_config_exposes_coco_parity_knobs():
-    cfg = TrainConfig(amp=True, multi_scale=0.5, gpus="0,1", val_coco=True, require_gpu=True, single_cls=True, freeze=2, time=1.0)
+    cfg = TrainConfig(
+        amp=True,
+        multi_scale=0.5,
+        gpus="0,1",
+        val_coco=True,
+        require_gpu=True,
+        single_cls=True,
+        freeze=2,
+        time=1.0,
+        compile_train_step=True,
+        fast_data=True,
+        fast_nms=True,
+        cache_images="auto",
+    )
     assert cfg.amp is True
     assert cfg.multi_scale == 0.5
     assert cfg.gpus == "0,1"
@@ -56,3 +90,46 @@ def test_train_config_exposes_coco_parity_knobs():
     assert cfg.single_cls is True
     assert cfg.freeze == 2
     assert cfg.time == 1.0
+    assert cfg.compile_train_step is True
+    assert cfg.fast_data is True
+    assert cfg.fast_nms is True
+    assert cfg.cache_images == "auto"
+
+
+def test_coco_validation_merges_native_and_coco_metrics(tmp_path, monkeypatch):
+    root = tmp_path / "coco_val"
+    image_dir = root / "images" / "val2017"
+    label_dir = root / "labels" / "val2017"
+    ann_dir = root / "annotations"
+    image_dir.mkdir(parents=True)
+    label_dir.mkdir(parents=True)
+    ann_dir.mkdir(parents=True)
+    Image.new("RGB", (64, 64), (0, 0, 0)).save(image_dir / "000000000001.jpg")
+    (label_dir / "000000000001.txt").write_text("0 0.5 0.5 0.25 0.25\n", encoding="utf-8")
+    ann = {
+        "images": [{"id": 1, "file_name": "000000000001.jpg", "width": 64, "height": 64}],
+        "annotations": [{"id": 1, "image_id": 1, "category_id": 1, "bbox": [24, 24, 16, 16], "iscrowd": 0}],
+        "categories": [{"id": 1, "name": "person"}],
+    }
+    ann_file = ann_dir / "instances_val2017.json"
+    ann_file.write_text(json.dumps(ann), encoding="utf-8")
+    data = {
+        "path": str(root),
+        "val": "images/val2017",
+        "val_annotations": "annotations/instances_val2017.json",
+        "nc": 1,
+        "names": ["person"],
+    }
+
+    class EmptyModel:
+        def __call__(self, images, training=False):
+            return tf.zeros((tf.shape(images)[0], 0, 6), tf.float32)
+
+    monkeypatch.setattr(
+        "yolo26_tf.validation.evaluate_coco_predictions",
+        lambda ann_path, rows, image_ids=None: {"metrics/mAP50-95(B)": 0.123, "metrics/mAP50(B)": 0.456, "fitness": 0.423},
+    )
+    result = validate_detection_model(EmptyModel(), data, imgsz=64, batch=1, use_coco=True, verbose=False)
+    assert "metrics/precision(B)" in result
+    assert result["metrics/mAP50-95(B)"] == 0.123
+    assert result["nt_per_class"] == {0: 1}

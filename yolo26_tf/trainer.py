@@ -49,6 +49,11 @@ class TrainConfig:
     seed: int = 0
     fraction: float = 1.0
     cache: bool | str = False
+    cache_images: str = "auto"
+    cache_ram_gb: float = 8.0
+    use_tfrecord: bool = True
+    tfrecord_dir: str | Path | None = None
+    rebuild_tfrecord: bool = False
     rect: bool = False
     workers: int = 8
     gpus: str | None = None
@@ -66,6 +71,11 @@ class TrainConfig:
     save_period: int = -1
     log_interval: int = 10
     cls_pw: float = 0.0
+    compile_train_step: bool = True
+    fast_data: bool = True
+    fast_nms: bool = True
+    profile_speed: bool = True
+    profile_interval: int = 0
 
 
 DEFAULT_HYP = {
@@ -78,15 +88,20 @@ DEFAULT_HYP = {
     "fliplr": 0.5,
     "flipud": 0.0,
     "mosaic": 1.0,
+    "mosaic_n": 4,
     "mixup": 0.0,
     "cutmix": 0.0,
     "copy_paste": 0.0,
+    "copy_paste_mode": "flip",
     "degrees": 0.0,
     "translate": 0.1,
     "scale": 0.5,
     "shear": 0.0,
     "perspective": 0.0,
     "bgr": 0.0,
+    "augmentations": None,
+    "mask_ratio": 4,
+    "overlap_mask": True,
 }
 
 
@@ -121,6 +136,7 @@ class YOLO26Trainer:
         self.loss_fn = None
         self.accum_grads = None
         self.accum_counter = 0
+        self._compiled_train_step_failed = False
         self.total_iterations = 1
         self.bias_lr = self.cfg.lr0
         self.train_time_start = 0.0
@@ -164,6 +180,7 @@ class YOLO26Trainer:
         if self.cfg.amp:
             tf.keras.mixed_precision.set_global_policy("mixed_float16")
         self._freeze_layers()
+        self._prepare_tfrecords()
         self.args_file.write_text(json.dumps({"config": asdict(self.cfg), "hyp": self.hyp}, indent=2, default=str), encoding="utf-8")
         print(
             f"Starting YOLO26 training: epochs={self.cfg.epochs}, imgsz={self.cfg.imgsz}, "
@@ -180,6 +197,10 @@ class YOLO26Trainer:
             shuffle=True,
             rect=self.cfg.rect,
             cache=self.cfg.cache,
+            cache_images=self.cfg.cache_images,
+            cache_ram_gb=self.cfg.cache_ram_gb,
+            use_tfrecord=self.cfg.use_tfrecord,
+            tfrecord_dir=self.cfg.tfrecord_dir,
             fraction=self.cfg.fraction,
             seed=self.cfg.seed,
             drop_last=self.replicas > 1,
@@ -229,15 +250,28 @@ class YOLO26Trainer:
             start = time.time()
             losses = []
             print(f"epoch {epoch + 1}/{self.cfg.epochs} starting, batches={len(train_ds)}", flush=True)
-            iterator = train_ds.as_tf_dataset(prefetch=max(self.cfg.workers, 1)) if self.replicas > 1 else train_ds
+            use_fast_data = bool(self.cfg.fast_data and not train_ds.rect)
+            if use_fast_data:
+                iterator = train_ds.as_fast_tf_dataset(parallel_calls=max(self.cfg.workers, 1))
+            elif self.replicas > 1:
+                iterator = train_ds.as_tf_dataset(prefetch=max(self.cfg.workers, 1))
+            else:
+                iterator = train_ds
             if self.replicas > 1:
                 iterator = self.strategy.experimental_distribute_dataset(iterator)
-            for i, batch_data in enumerate(iterator):
+            iter_obj = iter(iterator)
+            data_wait = 0.0
+            train_wait = 0.0
+            data_t0 = time.perf_counter()
+            for i in range(len(train_ds)):
+                batch_data = next(iter_obj)
+                data_wait += time.perf_counter() - data_t0
                 ni = epoch * len(train_ds) + i
                 lr = self._set_lr_momentum(ni, nw)
                 current_accumulate = accumulate
                 if nw and ni <= nw:
                     current_accumulate = max(1, int(round(np.interp(ni, [0, nw], [1, accumulate]).item())))
+                train_t0 = time.perf_counter()
                 try:
                     if self.replicas > 1:
                         per_replica = self.strategy.run(self._train_step, args=(batch_data, current_accumulate, lr))
@@ -249,19 +283,36 @@ class YOLO26Trainer:
                     if self._recover_from_nan(epoch):
                         continue
                     raise
+                train_wait += time.perf_counter() - train_t0
                 losses.append(np.asarray(loss_items.numpy(), dtype=np.float32))
+                try:
+                    batch_size_seen = int(batch_data["img"].shape[0]) if batch_data["img"].shape[0] is not None else self.cfg.batch
+                except Exception:
+                    batch_size_seen = self.cfg.batch
+                images_per_sec = batch_size_seen / max(train_wait / max(i + 1, 1), 1e-9)
+                profile_interval = self.cfg.profile_interval or self.cfg.log_interval
                 if i == 0 or (self.cfg.log_interval > 0 and (i + 1) % self.cfg.log_interval == 0) or (i + 1) == len(train_ds):
                     li = losses[-1]
+                    speed = ""
+                    if self.cfg.profile_speed and (profile_interval <= 0 or i == 0 or (i + 1) % profile_interval == 0 or (i + 1) == len(train_ds)):
+                        speed = (
+                            f" data_ms={data_wait * 1000 / max(i + 1, 1):.1f}"
+                            f" train_ms={train_wait * 1000 / max(i + 1, 1):.1f}"
+                            f" img_s={images_per_sec:.1f}"
+                        )
                     print(
                         f"epoch {epoch + 1}/{self.cfg.epochs} batch {i + 1}/{len(train_ds)} "
-                        f"box={li[0]:.4f} cls={li[1]:.4f} dfl={li[2]:.4f} lr={lr:.6g}",
+                        f"box={li[0]:.4f} cls={li[1]:.4f} dfl={li[2]:.4f} lr={lr:.6g}{speed}",
                         flush=True,
                     )
+                data_t0 = time.perf_counter()
             self._flush_accumulated(lr=self._current_lr())
             if self.loss_fn:
                 self.loss_fn.update()
             train_loss = np.mean(losses, axis=0).tolist() if losses else [0.0, 0.0, 0.0]
+            val_start = time.perf_counter()
             metrics = self._validate(epoch) if self.cfg.val and self.data.get("val") else {"fitness": -float(sum(train_loss))}
+            val_ms = (time.perf_counter() - val_start) * 1000.0
             fitness = float(metrics.get("fitness", metrics.get("metrics/mAP50-95(B)", 0.0)))
             improved = fitness >= self.best_fitness
             if improved:
@@ -277,6 +328,10 @@ class YOLO26Trainer:
                 "cls_loss": float(train_loss[1]),
                 "dfl_loss": float(train_loss[2]),
                 **metrics,
+                "speed/data_ms_per_batch": float(data_wait * 1000 / max(len(train_ds), 1)),
+                "speed/train_ms_per_batch": float(train_wait * 1000 / max(len(train_ds), 1)),
+                "speed/images_per_sec": float((len(train_ds.indices) if hasattr(train_ds, "indices") else len(train_ds) * self.cfg.batch) / max(train_wait, 1e-9)),
+                "speed/val_ms": float(val_ms),
                 "time": time.time() - start,
             }
             self.history.append(row)
@@ -297,6 +352,42 @@ class YOLO26Trainer:
         return {"save_dir": str(self.save_dir), "best": str(self.best), "last": str(self.last), "history": self.history, "final_metrics": final_metrics}
 
     def _train_step(self, batch_tf: dict, accumulate: int, lr: float):
+        if self.cfg.compile_train_step and not self._compiled_train_step_failed:
+            try:
+                loss_items, grads = self._compiled_grad_step(batch_tf, tf.cast(accumulate, tf.float32))
+            except Exception as exc:
+                self._compiled_train_step_failed = True
+                print(f"compiled train step disabled after failure: {exc}", flush=True)
+                loss_items, grads = self._eager_grad_step(batch_tf, accumulate)
+        else:
+            loss_items, grads = self._eager_grad_step(batch_tf, accumulate)
+        for acc, grad in zip(self.accum_grads, grads):
+            if grad is not None:
+                acc.assign_add(tf.cast(grad, acc.dtype))
+        self.accum_counter += 1
+        if self.accum_counter % accumulate == 0:
+            self._apply_accumulated(lr)
+        if not tf.reduce_all(tf.math.is_finite(loss_items)):
+            raise FloatingPointError("Non-finite YOLO26 loss encountered")
+        return tf.cast(loss_items, tf.float32)
+
+    @tf.function(reduce_retracing=True)
+    def _compiled_grad_step(self, batch_tf: dict, accumulate_f):
+        batch_tf = to_tensor_batch(batch_tf)
+        if self.cfg.multi_scale > 0.0:
+            batch_tf = multiscale_batch_tf(batch_tf, self.cfg.imgsz, factor=self.cfg.multi_scale)
+        with tf.GradientTape() as tape:
+            preds = self.model(batch_tf["img"], training=True)
+            loss, loss_items = self.loss_fn(preds, batch_tf)
+            loss = tf.cast(loss, tf.float32) / tf.maximum(tf.cast(accumulate_f, tf.float32), 1.0)
+            scaled_loss = scale_loss(self.optimizer, loss)
+        grads = tape.gradient(scaled_loss, self.model.trainable_variables)
+        grads = unscale_grads(self.optimizer, grads)
+        grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, self.model.trainable_variables)]
+        tf.debugging.assert_all_finite(tf.cast(loss_items, tf.float32), "Non-finite YOLO26 loss encountered")
+        return tf.cast(loss_items, tf.float32), grads
+
+    def _eager_grad_step(self, batch_tf: dict, accumulate: int):
         batch_tf = to_tensor_batch(batch_tf)
         if self.cfg.multi_scale > 0.0:
             batch_tf = multiscale_batch(batch_tf, self.cfg.imgsz, factor=self.cfg.multi_scale)
@@ -307,15 +398,8 @@ class YOLO26Trainer:
             scaled_loss = scale_loss(self.optimizer, loss)
         grads = tape.gradient(scaled_loss, self.model.trainable_variables)
         grads = unscale_grads(self.optimizer, grads)
-        for acc, grad in zip(self.accum_grads, grads):
-            if grad is not None:
-                acc.assign_add(tf.cast(grad, acc.dtype))
-        self.accum_counter += 1
-        if self.accum_counter % accumulate == 0:
-            self._apply_accumulated(lr)
-        if not tf.reduce_all(tf.math.is_finite(loss_items)):
-            raise FloatingPointError("Non-finite YOLO26 loss encountered")
-        return tf.cast(loss_items, tf.float32)
+        grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, self.model.trainable_variables)]
+        return tf.cast(loss_items, tf.float32), grads
 
     def _apply_accumulated(self, lr: float):
         grads = [g.read_value() for g in self.accum_grads]
@@ -381,6 +465,7 @@ class YOLO26Trainer:
                 name=f"val_epoch{epoch + 1}",
                 verbose=False,
                 single_cls=self.cfg.single_cls,
+                fast_nms=self.cfg.fast_nms,
             )
         finally:
             if self.ema:
@@ -411,6 +496,22 @@ class YOLO26Trainer:
     def _load_resume_training_state(self):
         self._load_optimizer_state()
         self._load_ema_state()
+
+    def _prepare_tfrecords(self):
+        if not self.cfg.use_tfrecord or not self.cfg.rebuild_tfrecord:
+            return
+        from .tfrecord import default_tfrecord_path, write_yolo_tfrecord
+
+        tfrecord_dir = Path(self.cfg.tfrecord_dir) if self.cfg.tfrecord_dir else Path(self.data["path"]) / "tfrecords"
+        tfrecord_dir.mkdir(parents=True, exist_ok=True)
+        for split in ("train", "val"):
+            if split not in self.data or self.data.get(split) is None:
+                continue
+            out = default_tfrecord_path(self.data, split, tfrecord_dir=tfrecord_dir)
+            print(f"Writing {split} TFRecord to {out}", flush=True)
+            stats = write_yolo_tfrecord(self.data, split, out)
+            self.data[f"{split}_tfrecord"] = Path(stats["path"])
+            print(f"Wrote {split} TFRecord: {stats}", flush=True)
 
     def _set_class_weights(self, train_ds: YOLODataset):
         """Compute Ultralytics-style inverse-frequency class weights when requested."""
@@ -559,6 +660,7 @@ class YOLO26Trainer:
                 name="final_best_val",
                 verbose=False,
                 single_cls=self.cfg.single_cls,
+                fast_nms=self.cfg.fast_nms,
             )
             (self.save_dir / "final_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
             return metrics
@@ -578,6 +680,18 @@ def multiscale_batch(batch: dict, base_imgsz: int, factor: float = 0.5, stride: 
     size = random.randrange(low, high + stride, stride)
     if int(batch["img"].shape[1]) == size:
         return batch
+    out = dict(batch)
+    out["img"] = tf.image.resize(batch["img"], [size, size], method="bilinear")
+    return out
+
+
+def multiscale_batch_tf(batch: dict, base_imgsz: int, factor: float = 0.5, stride: int = 32) -> dict:
+    factor = float(factor)
+    low = max(stride, int(base_imgsz * (1.0 - factor)) // stride * stride)
+    high = max(low, int(base_imgsz * (1.0 + factor)) // stride * stride)
+    steps = max((high - low) // stride + 1, 1)
+    offset = tf.random.uniform([], minval=0, maxval=steps, dtype=tf.int32)
+    size = tf.cast(low + offset * stride, tf.int32)
     out = dict(batch)
     out["img"] = tf.image.resize(batch["img"], [size, size], method="bilinear")
     return out

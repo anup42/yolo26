@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import random
 import hashlib
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
@@ -66,7 +67,7 @@ def load_data_yaml(path: str | Path | dict) -> dict[str, Any]:
     for split in ("train", "val", "test"):
         if split in data and data[split] is not None:
             data[split] = resolve_path_or_list(data[split], root)
-    for key in ("train_annotations", "val_annotations", "test_annotations", "annotations"):
+    for key in ("train_annotations", "val_annotations", "test_annotations", "annotations", "train_tfrecord", "val_tfrecord", "test_tfrecord"):
         if key in data and data[key] is not None:
             p = Path(data[key])
             data[key] = p if p.is_absolute() else root / p
@@ -248,6 +249,10 @@ class YOLODataset:
         drop_last: bool = False,
         classes: list[int] | tuple[int, ...] | None = None,
         single_cls: bool = False,
+        cache_images: str | bool = "auto",
+        cache_ram_gb: float = 8.0,
+        use_tfrecord: bool = True,
+        tfrecord_dir: str | Path | None = None,
     ):
         self.data = load_data_yaml(data)
         self.split = split
@@ -262,6 +267,13 @@ class YOLODataset:
         self.drop_last = bool(drop_last)
         self.classes = None if classes is None else np.asarray(classes, dtype=np.int64).reshape(1, -1)
         self.single_cls = bool(single_cls)
+        self.cache_images = normalize_cache_images(cache_images)
+        self.cache_ram_gb = float(cache_ram_gb)
+        self.use_tfrecord = bool(use_tfrecord)
+        self.tfrecord_dir = tfrecord_dir
+        self.tfrecord_path = self._resolve_tfrecord_path()
+        self._record_image_bytes: list[bytes] | None = None
+        self.image_cache: dict[int, np.ndarray] = {}
         self.rng = random.Random(self.seed)
         self.hyp = {
             "hsv_h": 0.015,
@@ -281,23 +293,38 @@ class YOLODataset:
             "shear": 0.0,
             "perspective": 0.0,
             "bgr": 0.0,
+            "augmentations": None,
+            "mask_ratio": 4,
+            "overlap_mask": True,
         }
         if hyp:
             self.hyp.update(hyp)
         if self.rect:
             self.hyp["mosaic"] = self.hyp["mixup"] = self.hyp["cutmix"] = 0.0
-        self.im_files = list_images(self.data[split])
-        if not self.im_files:
-            raise FileNotFoundError(f"No images found for split '{split}' at {self.data[split]}")
-        if 0 < self.fraction < 1:
-            n = max(1, int(round(len(self.im_files) * self.fraction)))
-            self.im_files = self.im_files[:n]
-        self.label_files = [img2label_path(p) for p in self.im_files]
-        self.labels = self._load_or_build_cache() if cache else [verify_image_label(p, self.data["nc"]) for p in self.im_files]
+        loaded_records = self._load_tfrecord_if_available()
+        if loaded_records:
+            if 0 < self.fraction < 1:
+                n = max(1, int(round(len(loaded_records) * self.fraction)))
+                loaded_records = loaded_records[:n]
+            self.im_files = [Path(x["im_file"]) for x in loaded_records]
+            self.label_files = [img2label_path(p) for p in self.im_files]
+            self.labels = [{k: v for k, v in x.items() if k != "image_bytes"} for x in loaded_records]
+            self._record_image_bytes = [x["image_bytes"] for x in loaded_records]
+        else:
+            self.im_files = list_images(self.data[split])
+            if not self.im_files:
+                raise FileNotFoundError(f"No images found for split '{split}' at {self.data[split]}")
+            if 0 < self.fraction < 1:
+                n = max(1, int(round(len(self.im_files) * self.fraction)))
+                self.im_files = self.im_files[:n]
+            self.label_files = [img2label_path(p) for p in self.im_files]
+            self.labels = self._load_or_build_cache() if cache else [verify_image_label(p, self.data["nc"]) for p in self.im_files]
         ok = [i for i, x in enumerate(self.labels) if x.get("ok", False)]
         self.im_files = [self.im_files[i] for i in ok]
         self.label_files = [self.label_files[i] for i in ok]
         self.labels = [self.labels[i] for i in ok]
+        if self._record_image_bytes is not None:
+            self._record_image_bytes = [self._record_image_bytes[i] for i in ok]
         self._filter_labels()
         if self.rect:
             order = sorted(range(len(self.im_files)), key=lambda i: self.labels[i]["shape"][0] / max(self.labels[i]["shape"][1], 1))
@@ -311,6 +338,7 @@ class YOLODataset:
             self.batch_shapes = None
         self.transforms = self.build_transforms()
         self.buffer: list[int] = []
+        self._build_image_cache()
         self.on_epoch_end()
 
     def __len__(self):
@@ -322,6 +350,60 @@ class YOLODataset:
         root = Path(split_path[0] if isinstance(split_path, list) else split_path)
         base = root if root.is_dir() else root.parent
         return base / f"{self.split}.labels.cache.json"
+
+    def _resolve_tfrecord_path(self) -> Path | None:
+        key = f"{self.split}_tfrecord"
+        if self.data.get(key):
+            return Path(self.data[key])
+        if self.tfrecord_dir:
+            return Path(self.tfrecord_dir) / f"{self.split}.tfrecord"
+        candidate = Path(self.data["path"]) / "tfrecords" / f"{self.split}.tfrecord"
+        return candidate if candidate.exists() else None
+
+    def _load_tfrecord_if_available(self) -> list[dict] | None:
+        if not self.use_tfrecord or self.tfrecord_path is None or not Path(self.tfrecord_path).exists():
+            return None
+        from .tfrecord import load_yolo_tfrecord
+
+        max_bytes = int(max(self.cache_ram_gb, 0.0) * (1024**3)) if self.cache_ram_gb > 0 else None
+        try:
+            records = load_yolo_tfrecord(self.tfrecord_path, max_bytes=max_bytes)
+            print(f"Loaded {len(records)} {self.split} TFRecord images from {self.tfrecord_path}", flush=True)
+            return records
+        except MemoryError as exc:
+            print(f"TFRecord random-access cache skipped: {exc}", flush=True)
+            return None
+
+    def _read_image(self, idx: int) -> np.ndarray:
+        if idx in self.image_cache:
+            return self.image_cache[idx].copy()
+        if self._record_image_bytes is not None:
+            return np.asarray(Image.open(BytesIO(self._record_image_bytes[idx])).convert("RGB"))
+        return np.asarray(Image.open(self.im_files[idx]).convert("RGB"))
+
+    def _build_image_cache(self):
+        if self._record_image_bytes is not None or self.cache_images == "off":
+            return
+        limit = int(max(self.cache_ram_gb, 0.0) * (1024**3))
+        if limit <= 0:
+            return
+        total = 0
+        cached = 0
+        for i in range(len(self.im_files)):
+            try:
+                img = np.asarray(Image.open(self.im_files[i]).convert("RGB"))
+            except Exception:
+                continue
+            nbytes = int(img.nbytes)
+            if total + nbytes > limit:
+                if self.cache_images == "ram":
+                    print(f"RAM image cache reached {total / (1024**3):.2f} GB before caching all images.", flush=True)
+                break
+            self.image_cache[i] = img
+            total += nbytes
+            cached += 1
+        if cached:
+            print(f"Cached {cached}/{len(self.im_files)} {self.split} images in RAM ({total / (1024**3):.2f} GB).", flush=True)
 
     def _load_or_build_cache(self):
         cache_file = self._cache_file()
@@ -461,14 +543,23 @@ class YOLODataset:
                 pre_transform,
                 MixUp(self, pre_transform=pre_transform, p=hyp.get("mixup", 0.0)),
                 CutMix(self, pre_transform=pre_transform, p=hyp.get("cutmix", 0.0)),
-                Albumentations(p=1.0),
+                Albumentations(p=1.0, transforms=hyp.get("augmentations")),
                 RandomHSV(hgain=hyp.get("hsv_h", 0.015), sgain=hyp.get("hsv_s", 0.7), vgain=hyp.get("hsv_v", 0.4)),
                 RandomFlip(direction="vertical", p=hyp.get("flipud", 0.0)),
                 RandomFlip(direction="horizontal", p=hyp.get("fliplr", 0.5)),
             ]
         else:
             transforms = [LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)]
-        transforms.append(Format(bbox_format="xywh", normalize=True, batch_idx=True, bgr=hyp.get("bgr", 0.0) if self.augment else 0.0))
+        transforms.append(
+            Format(
+                bbox_format="xywh",
+                normalize=True,
+                batch_idx=True,
+                bgr=hyp.get("bgr", 0.0) if self.augment else 0.0,
+                mask_ratio=hyp.get("mask_ratio", 4),
+                mask_overlap=hyp.get("overlap_mask", True),
+            )
+        )
         return Compose(transforms)
 
     def update_labels_info(self, label: dict) -> dict:
@@ -486,7 +577,7 @@ class YOLODataset:
 
     def get_image_and_label(self, idx: int) -> dict:
         path = self.im_files[idx]
-        img = np.asarray(Image.open(path).convert("RGB"))
+        img = self._read_image(idx)
         shape = img.shape[:2]
         label = dict(self.labels[idx])
         label.update(
@@ -508,7 +599,7 @@ class YOLODataset:
 
     def load_one(self, idx: int, rect_shape: tuple[int, int] | None = None):
         path = self.im_files[idx]
-        img0 = np.asarray(Image.open(path).convert("RGB"))
+        img0 = self._read_image(idx)
         h0, w0 = img0.shape[:2]
         label = self.labels[idx]
         cls = label["cls"].copy()
@@ -722,3 +813,78 @@ class YOLODataset:
         }
         ds = tf.data.Dataset.from_generator(self.numeric_batches, output_signature=signature)
         return ds.prefetch(prefetch)
+
+    def _sample_for_tf(self, idx):
+        i = int(np.asarray(idx).reshape(()))
+        labels = self.get_image_and_label(i)
+        sample = self.transforms(labels)
+        img = np.asarray(sample["img"], dtype=np.float32)
+        boxes = np.asarray(sample.get("bboxes", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32).reshape(-1, 4)
+        cls = np.asarray(sample.get("cls", np.zeros((len(boxes),), dtype=np.int64)), dtype=np.int64).reshape(-1)
+        if len(boxes) == 0:
+            boxes = np.zeros((1, 4), dtype=np.float32)
+            cls = np.zeros((1,), dtype=np.int64)
+            mask = np.zeros((1,), dtype=bool)
+        else:
+            mask = np.ones((len(boxes),), dtype=bool)
+        return img, boxes, cls, mask
+
+    def as_fast_tf_dataset(self, prefetch: int | None = None, parallel_calls: int | None = None):
+        tf = require_tf()
+        autotune = tf.data.AUTOTUNE
+        prefetch = autotune if prefetch is None or prefetch <= 0 else int(prefetch)
+        parallel_calls = autotune if parallel_calls is None or parallel_calls <= 0 else int(parallel_calls)
+        ds = tf.data.Dataset.from_tensor_slices(np.asarray(self.indices, dtype=np.int64))
+
+        def load_sample(idx):
+            img, boxes, cls, mask = tf.py_function(self._sample_for_tf, [idx], [tf.float32, tf.float32, tf.int64, tf.bool])
+            img.set_shape([None, None, 3])
+            boxes.set_shape([None, 4])
+            cls.set_shape([None])
+            mask.set_shape([None])
+            return {"img": img, "bboxes": boxes, "cls": cls, "mask": mask}
+
+        ds = ds.map(load_sample, num_parallel_calls=parallel_calls, deterministic=not self.shuffle)
+        ds = ds.padded_batch(
+            self.batch,
+            padded_shapes={"img": [None, None, 3], "bboxes": [None, 4], "cls": [None], "mask": [None]},
+            padding_values={
+                "img": np.float32(0.0),
+                "bboxes": np.float32(0.0),
+                "cls": np.int64(0),
+                "mask": np.bool_(False),
+            },
+            drop_remainder=self.drop_last,
+        )
+        ds = ds.map(format_fast_batch, num_parallel_calls=autotune)
+        return ds.prefetch(prefetch)
+
+
+def format_fast_batch(batch: dict) -> dict:
+    tf = require_tf()
+    mask = tf.cast(batch["mask"], tf.bool)
+    flat_idx = tf.where(mask)
+    flat_bboxes = tf.boolean_mask(batch["bboxes"], mask)
+    flat_cls = tf.cast(tf.boolean_mask(batch["cls"], mask)[:, None], tf.float32)
+    return {
+        "img": tf.cast(batch["img"], tf.float32),
+        "bboxes": tf.cast(batch["bboxes"], tf.float32),
+        "cls": tf.cast(batch["cls"], tf.int64),
+        "mask": mask,
+        "batch_idx": tf.cast(flat_idx[:, 0:1], tf.float32),
+        "flat_cls": flat_cls,
+        "flat_bboxes": tf.cast(flat_bboxes, tf.float32),
+    }
+
+
+def normalize_cache_images(value) -> str:
+    if isinstance(value, bool):
+        return "ram" if value else "off"
+    text = str(value or "off").lower()
+    if text in {"true", "1", "yes"}:
+        return "ram"
+    if text in {"false", "0", "no"}:
+        return "off"
+    if text not in {"auto", "ram", "off"}:
+        raise ValueError("cache_images must be one of {'auto', 'ram', 'off'}.")
+    return text

@@ -299,6 +299,8 @@ class DetectionLoss:
         pred_dist = tf.cast(preds["boxes"], tf.float32)
         pred_scores = tf.cast(preds["scores"], tf.float32)
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
+        anchor_points = tf.cast(anchor_points, pred_dist.dtype)
+        stride_tensor = tf.cast(stride_tensor, pred_dist.dtype)
         imgsz = tf.cast(tf.shape(batch["img"])[1:3], pred_scores.dtype)
         pred_bboxes_grid = self.bbox_decode(anchor_points, pred_dist)
         pred_bboxes = pred_bboxes_grid * stride_tensor[None, :, :]

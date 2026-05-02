@@ -11,10 +11,10 @@ from PIL import Image
 from .data import load_data_yaml
 from .export import export_model
 from .model import DetectionModel, build_model
-from .ops import letterbox, nms_numpy, scale_boxes_np
+from .ops import letterbox, scale_boxes_np
 from .tf_import import require_tf
 from .trainer import DEFAULT_HYP, TrainConfig, YOLO26Trainer
-from .validation import validate_detection_model
+from .validation import prediction_to_detections, validate_detection_model
 
 tf = require_tf()
 
@@ -90,8 +90,8 @@ class YOLO26:
         data: str | Path | dict,
         imgsz: int | None = None,
         batch: int = 16,
-        conf: float = 0.25,
-        iou: float = 0.45,
+        conf: float = 0.001,
+        iou: float = 0.7,
         max_det: int = 300,
         coco: bool = False,
         save_json: bool = False,
@@ -116,14 +116,25 @@ class YOLO26:
             save_conf=kwargs.get("save_conf", False),
             single_cls=kwargs.get("single_cls", False),
             agnostic_nms=kwargs.get("agnostic_nms", False),
-            multi_label=kwargs.get("multi_label", False),
+            multi_label=kwargs.get("multi_label", True),
             half=kwargs.get("half", False),
             project=project,
             name=name,
+            fast_nms=kwargs.get("fast_nms", True),
             verbose=verbose,
         )
 
-    def predict(self, source: str | Path | np.ndarray, imgsz: int | None = None, conf: float = 0.25, iou: float = 0.45, max_det: int = 300) -> list[dict]:
+    def predict(
+        self,
+        source: str | Path | np.ndarray,
+        imgsz: int | None = None,
+        conf: float = 0.25,
+        iou: float = 0.45,
+        max_det: int = 300,
+        agnostic_nms: bool = False,
+        multi_label: bool = False,
+        single_cls: bool = False,
+    ) -> list[dict]:
         imgsz = int(imgsz or self.imgsz)
         paths, images = self._load_sources(source)
         results = []
@@ -131,15 +142,9 @@ class YOLO26:
             img, ratio, pad = letterbox(img0, imgsz, scaleup=False)
             x = img.astype(np.float32)[None] / 255.0
             raw = self.model(tf.convert_to_tensor(x), training=False).numpy()[0]
-            if raw.shape[-1] == 6:
-                det = raw[raw[:, 4] >= conf]
-                if len(det) > max_det:
-                    det = det[np.argsort(-det[:, 4])[:max_det]]
-            else:
-                boxes, scores = raw[:, :4], raw[:, 4:]
-                cls = scores.argmax(axis=-1)
-                score = scores.max(axis=-1)
-                det = nms_numpy(np.concatenate([boxes, score[:, None], cls[:, None]], axis=-1), conf, iou, max_det)
+            det = prediction_to_detections(raw, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms or single_cls, multi_label=multi_label)
+            if single_cls and len(det):
+                det[:, 5] = 0
             if len(det):
                 det[:, :4] = scale_boxes_np(det[:, :4], (imgsz, imgsz), img0.shape[:2], ((ratio[0], ratio[1]), pad))
             results.append({"path": path, "boxes": det[:, :4], "conf": det[:, 4], "cls": det[:, 5].astype(np.int64), "names": self.names})

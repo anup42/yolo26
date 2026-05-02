@@ -27,27 +27,7 @@ def ap_per_class(preds: list[np.ndarray], targets: list[tuple[np.ndarray, np.nda
     for img_i, (pred, (gt_cls, gt_boxes)) in enumerate(zip(preds, targets)):
         gt_cls = gt_cls.astype(np.int64)
         target_cls_all.extend(gt_cls.tolist())
-        correct = np.zeros((len(pred), len(iouv)), dtype=bool)
-        if len(pred) and len(gt_cls):
-            for cls in np.unique(np.concatenate([pred[:, 5].astype(np.int64), gt_cls])):
-                pi = np.where(pred[:, 5].astype(np.int64) == cls)[0]
-                ti = np.where(gt_cls == cls)[0]
-                if len(pi) == 0 or len(ti) == 0:
-                    continue
-                ious = pairwise_iou_np(pred[pi, :4], gt_boxes[ti])
-                matches = np.argwhere(ious >= iouv[0])
-                if len(matches):
-                    match_rows = []
-                    for p_rel, t_rel in matches:
-                        match_rows.append((float(ious[p_rel, t_rel]), int(pi[p_rel]), int(ti[t_rel])))
-                    match_rows.sort(reverse=True)
-                    used_p, used_t = set(), set()
-                    for iou, p_abs, t_abs in match_rows:
-                        if p_abs in used_p or t_abs in used_t:
-                            continue
-                        used_p.add(p_abs)
-                        used_t.add(t_abs)
-                        correct[p_abs] = iou >= iouv
+        correct = process_batch(pred, gt_cls, gt_boxes, iouv)
         if len(pred):
             stats.append((correct, pred[:, 4].astype(np.float32), pred[:, 5].astype(np.int64), gt_cls))
 
@@ -84,6 +64,16 @@ def ap_per_class(preds: list[np.ndarray], targets: list[tuple[np.ndarray, np.nda
     map50 = float(ap[:, 0].mean()) if ap.size else 0.0
     map5095 = float(ap.mean()) if ap.size else 0.0
     fitness = 0.1 * map50 + 0.9 * map5095
+    per_class = {
+        int(c): {
+            "precision": float(precision_cls[i]),
+            "recall": float(recall_cls[i]),
+            "mAP50": float(ap[i, 0]) if ap.size else 0.0,
+            "mAP50-95": float(ap[i].mean()) if ap.size else 0.0,
+            "ap": [float(x) for x in ap[i].tolist()] if ap.size else [],
+        }
+        for i, c in enumerate(unique_classes)
+    }
     return {
         "metrics/precision(B)": mp,
         "metrics/recall(B)": mr,
@@ -92,6 +82,7 @@ def ap_per_class(preds: list[np.ndarray], targets: list[tuple[np.ndarray, np.nda
         "fitness": float(fitness),
         "nt_per_class": {int(c): int(n) for c, n in zip(unique_classes, nt_per_class)},
         "ap_class_index": [int(x) for x in unique_classes],
+        "per_class": per_class,
     }
 
 
@@ -102,21 +93,21 @@ def process_batch(detections: np.ndarray, gt_cls: np.ndarray, gt_boxes: np.ndarr
     if len(detections) == 0 or len(gt_cls) == 0:
         return correct
     ious = pairwise_iou_np(gt_boxes, detections[:, :4])
-    matches = np.argwhere(ious >= iouv[0])
-    if len(matches) == 0:
-        return correct
-    rows = []
-    for gt_i, pred_i in matches:
-        if int(gt_cls[gt_i]) == int(detections[pred_i, 5]):
-            rows.append((float(ious[gt_i, pred_i]), int(gt_i), int(pred_i)))
-    rows.sort(reverse=True)
-    used_gt, used_pred = set(), set()
-    for iou, gt_i, pred_i in rows:
-        if gt_i in used_gt or pred_i in used_pred:
+    correct_class = gt_cls[:, None].astype(np.int64) == detections[:, 5][None].astype(np.int64)
+    ious = ious * correct_class
+    for i, threshold in enumerate(iouv):
+        x = np.argwhere(ious >= threshold)
+        if len(x) == 0:
             continue
-        used_gt.add(gt_i)
-        used_pred.add(pred_i)
-        correct[pred_i] = iou >= iouv
+        if len(x) > 1:
+            matches = np.concatenate([x, ious[x[:, 0], x[:, 1]][:, None]], axis=1)
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        else:
+            matches = x
+        correct[matches[:, 1].astype(int), i] = True
     return correct
 
 
@@ -169,6 +160,16 @@ def ap_per_class_from_stats(stats: dict[str, list[np.ndarray]], iou_thres=None) 
     map50 = float(ap[:, 0].mean()) if ap.size else 0.0
     map5095 = float(ap.mean()) if ap.size else 0.0
     fitness = 0.1 * map50 + 0.9 * map5095
+    per_class = {
+        int(c): {
+            "precision": float(precision_cls[i]),
+            "recall": float(recall_cls[i]),
+            "mAP50": float(ap[i, 0]) if ap.size else 0.0,
+            "mAP50-95": float(ap[i].mean()) if ap.size else 0.0,
+            "ap": [float(x) for x in ap[i].tolist()] if ap.size else [],
+        }
+        for i, c in enumerate(unique_classes)
+    }
     return {
         "metrics/precision(B)": float(precision_cls.mean()) if len(precision_cls) else 0.0,
         "metrics/recall(B)": float(recall_cls.mean()) if len(recall_cls) else 0.0,
@@ -178,6 +179,7 @@ def ap_per_class_from_stats(stats: dict[str, list[np.ndarray]], iou_thres=None) 
         "nt_per_class": {int(c): int(n) for c, n in zip(unique_classes, nt_per_class)},
         "nt_per_image": nt_per_image,
         "ap_class_index": [int(x) for x in unique_classes],
+        "per_class": per_class,
     }
 
 
@@ -307,14 +309,29 @@ class DetMetrics:
 
     def class_result(self, i: int) -> tuple[float, float, float, float]:
         cls_id = int(self.ap_class_index[i])
-        if self.nt_per_class.get(cls_id, 0) == 0:
+        per_class = self.results_dict.get("per_class", {})
+        values = per_class.get(cls_id) or per_class.get(str(cls_id), {})
+        if self.nt_per_class.get(cls_id, 0) == 0 or not values:
             return 0.0, 0.0, 0.0, 0.0
-        return tuple(self.mean_results())
+        return (
+            float(values.get("precision", 0.0)),
+            float(values.get("recall", 0.0)),
+            float(values.get("mAP50", 0.0)),
+            float(values.get("mAP50-95", 0.0)),
+        )
 
     def summary(self, normalize: bool = True, decimals: int = 5) -> list[dict]:
         rows = []
-        for cls_id in self.ap_class_index:
-            row = {"Class": self.names.get(int(cls_id), str(cls_id)), "Images": len(self.targets), "Instances": self.nt_per_class.get(int(cls_id), 0)}
-            row.update({k: round(float(self.results_dict.get(k, 0.0)), decimals) for k in self.keys})
+        for i, cls_id in enumerate(self.ap_class_index):
+            p, r, map50, map5095 = self.class_result(i)
+            row = {
+                "Class": self.names.get(int(cls_id), str(cls_id)),
+                "Images": int(self.nt_per_image.get(int(cls_id), len(self.targets))),
+                "Instances": self.nt_per_class.get(int(cls_id), 0),
+                "metrics/precision(B)": round(p, decimals),
+                "metrics/recall(B)": round(r, decimals),
+                "metrics/mAP50(B)": round(map50, decimals),
+                "metrics/mAP50-95(B)": round(map5095, decimals),
+            }
             rows.append(row)
         return rows

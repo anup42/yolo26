@@ -81,16 +81,27 @@ YOLO26_COCO_EPOCHS_SMALL=2 \
 bash scripts/train_coco_yolo26n_linux.sh
 ```
 
+The training runner now defaults to the fast path:
+
+- compiled TensorFlow forward/loss/gradient step: `YOLO26_COCO_COMPILE=1`;
+- parallel `tf.data` sample pipeline with prefetch: `YOLO26_COCO_FAST_DATA=1`;
+- TFRecord generation and training input when available: `YOLO26_COCO_USE_TFRECORD=1`;
+- bounded record/image RAM cache: `YOLO26_COCO_CACHE_IMAGES=auto`, `YOLO26_COCO_CACHE_RAM_GB=32`;
+- TensorFlow graph NMS during validation: `YOLO26_COCO_FAST_NMS=1`;
+- speed profiling in batch logs plus `results.csv`/`results.json`: `speed/data_ms_per_batch`, `speed/train_ms_per_batch`, `speed/images_per_sec`, and `speed/val_ms`.
+
 For a full scratch COCO training run:
 
 ```bash
 YOLO26_COCO_PROFILE=full \
 YOLO26_COCO_EPOCHS_FULL=300 \
-YOLO26_COCO_BATCH=16 \
+YOLO26_COCO_BATCH=96 \
 YOLO26_COCO_IMGSZ=640 \
 YOLO26_COCO_NUMPY='numpy>=1.23.5,<2.0' \
 bash scripts/train_coco_yolo26n_linux.sh
 ```
+
+`YOLO26_COCO_BATCH=96` is the recommended starting point for an RTX A6000 48 GB run. Increase or reduce it based on actual memory use. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
 
 The script:
 
@@ -100,6 +111,7 @@ The script:
 - fails early if TensorFlow cannot see/use GPUs;
 - downloads COCO `train2017`, `val2017`, and annotations;
 - converts `instances_train2017.json` and `instances_val2017.json` into YOLO labels;
+- writes TFRecords for the selected training profile unless disabled;
 - trains scratch `yolo26n.yaml` with `yolo26-tf detect train`;
 - validates with pycocotools COCOeval;
 - exports `best.weights.h5` to TFLite and reloads the TFLite model for inference.

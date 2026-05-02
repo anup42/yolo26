@@ -23,3 +23,18 @@ def test_tf_export_nms_preserves_e2e_detection_contract():
     assert np.isclose(out[0, 0, 4], 0.9)
     assert np.isclose(out[0, 1, 5], 1.0)
 
+
+def test_tf_export_nms_supports_agnostic_e2e_nms():
+    pred = tf.constant(
+        [
+            [
+                [0.0, 0.0, 10.0, 10.0, 0.9, 0.0],
+                [0.0, 0.0, 10.0, 10.0, 0.8, 1.0],
+            ]
+        ],
+        tf.float32,
+    )
+    class_aware = tf_export_nms(pred, conf=0.1, iou=0.5, max_det=2, agnostic=False).numpy()
+    agnostic = tf_export_nms(pred, conf=0.1, iou=0.5, max_det=2, agnostic=True).numpy()
+    assert np.count_nonzero(class_aware[0, :, 4]) == 2
+    assert np.count_nonzero(agnostic[0, :, 4]) == 1

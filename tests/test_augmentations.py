@@ -54,6 +54,18 @@ def test_dataset_iterator_uses_transform_collate_contract(tmp_path):
     assert len(batch["pad"]) == 2
 
 
+def test_fast_tf_dataset_matches_numeric_contract(tmp_path):
+    data_yaml = create_tiny_dataset(tmp_path / "tiny_fast_tf", n=4, size=48)
+    ds = YOLODataset(data_yaml, split="train", imgsz=48, batch=2, augment=False, shuffle=False)
+    old = ds[0]
+    fast = next(iter(ds.as_fast_tf_dataset(prefetch=1, parallel_calls=1)))
+    assert tuple(fast["img"].shape) == old["img"].shape
+    assert tuple(fast["flat_bboxes"].shape)[1] == 4
+    assert tuple(fast["flat_cls"].shape)[1] == 1
+    assert tuple(fast["batch_idx"].shape)[1] == 1
+    assert int(fast["mask"].numpy().sum()) == int(old["mask"].sum())
+
+
 def test_instances_letterbox_format_pipeline():
     img = np.zeros((40, 80, 3), dtype=np.uint8)
     labels = {

@@ -11,6 +11,7 @@ import numpy as np
 
 from .coco import COCO80_TO_COCO91, coco_image_id_from_path, evaluate_coco_predictions
 from .data import YOLODataset, load_data_yaml
+from .export import tf_export_nms
 from .metrics import ConfusionMatrix, DetMetrics, process_batch, targets_from_batch
 from .ops import nms_numpy, scale_boxes_np
 from .tf_import import require_tf
@@ -23,8 +24,8 @@ def validate_detection_model(
     data: str | Path | dict,
     imgsz: int = 640,
     batch: int = 16,
-    conf: float = 0.25,
-    iou: float = 0.45,
+    conf: float = 0.001,
+    iou: float = 0.7,
     max_det: int = 300,
     rect: bool = True,
     use_coco: bool = False,
@@ -33,10 +34,11 @@ def validate_detection_model(
     save_conf: bool = False,
     single_cls: bool = False,
     agnostic_nms: bool = False,
-    multi_label: bool = False,
+    multi_label: bool = True,
     half: bool = False,
     project: str | Path = "runs/detect",
     name: str = "val",
+    fast_nms: bool = True,
     verbose: bool = True,
 ) -> dict[str, Any]:
     data_dict = load_data_yaml(data)
@@ -59,15 +61,24 @@ def validate_detection_model(
         images = tf.convert_to_tensor(b["img"], tf.float16 if half else tf.float32)
         t_pre += time.perf_counter() - t0
         t0 = time.perf_counter()
-        raw = model(images, training=False).numpy()
+        raw_tensor = model(images, training=False)
         t_infer += time.perf_counter() - t0
         t1 = time.perf_counter()
+        if fast_nms:
+            det_batch = tf_export_nms(raw_tensor, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms or single_cls).numpy()
+        else:
+            raw = raw_tensor.numpy()
+            det_batch = None
         input_shape = tuple(int(x) for x in b["img"].shape[1:3])
         batch_targets = targets_from_batch(b, input_shape)
         if single_cls:
             batch_targets = [(np.zeros_like(cls), boxes) for cls, boxes in batch_targets]
-        for si, (pred, im_file, shape, ratio, pad) in enumerate(zip(raw, b["im_file"], b["ori_shape"], b["ratio"], b["pad"])):
-            det = prediction_to_detections(pred, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms, multi_label=multi_label)
+        preds_iter = det_batch if fast_nms else raw
+        for si, (pred, im_file, shape, ratio, pad) in enumerate(zip(preds_iter, b["im_file"], b["ori_shape"], b["ratio"], b["pad"])):
+            if fast_nms:
+                det = pred[pred[:, 4] >= conf].astype(np.float32)
+            else:
+                det = prediction_to_detections(pred, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms, multi_label=multi_label)
             if single_cls and len(det):
                 det[:, 5] = 0
             preds_all.append(det.astype(np.float32))
@@ -95,15 +106,16 @@ def validate_detection_model(
                 save_one_txt(det, shape, input_shape, ratio, pad, label_dir / f"{Path(im_file).stem}.txt", save_conf)
         targets_all.extend(batch_targets)
         t_post += time.perf_counter() - t1
+    native_metrics = det_metrics.process()
     if use_coco:
         ann = data_dict.get("val_annotations") or data_dict.get("annotations")
         if ann is None:
             raise FileNotFoundError("COCO validation requested, but data YAML has no val_annotations or annotations entry.")
         if save_json:
             (out_dir / "predictions.json").write_text(json.dumps(coco_rows), encoding="utf-8")
-        metrics = evaluate_coco_predictions(ann, coco_rows, image_ids=image_ids)
+        metrics = {**native_metrics, **evaluate_coco_predictions(ann, coco_rows, image_ids=image_ids)}
     else:
-        metrics = det_metrics.process()
+        metrics = native_metrics
     metrics = {
         **metrics,
         "images": int(seen),
@@ -164,9 +176,20 @@ class DetectionValidator:
     def postprocess(self, preds: np.ndarray) -> list[np.ndarray]:
         keys = ("conf", "iou", "max_det", "agnostic_nms", "multi_label")
         opts = {k: self.args[k] for k in keys if k in self.args}
+        opts.setdefault("conf", 0.001)
+        opts.setdefault("iou", 0.7)
+        opts.setdefault("multi_label", True)
+        opts.setdefault("max_det", 300)
+        if self.args.get("single_cls", False):
+            opts["agnostic_nms"] = True
         if "agnostic_nms" in opts:
             opts["agnostic"] = opts.pop("agnostic_nms")
-        return [prediction_to_detections(p, **opts) for p in preds]
+        detections = [prediction_to_detections(p, **opts) for p in preds]
+        if self.args.get("single_cls", False):
+            for det in detections:
+                if len(det):
+                    det[:, 5] = 0
+        return detections
 
     def _prepare_batch(self, batch: dict, input_shape: tuple[int, int]) -> list[tuple[np.ndarray, np.ndarray]]:
         return targets_from_batch(batch, input_shape)

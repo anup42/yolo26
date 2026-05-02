@@ -258,7 +258,7 @@ def copy_paste_bbox_only(img, boxes, cls, p: float = 0.0):
     return img, boxes, cls
 
 
-def albumentations(img: np.ndarray, boxes: np.ndarray, cls: np.ndarray, p: float = 1.0):
+def albumentations(img: np.ndarray, boxes: np.ndarray, cls: np.ndarray, p: float = 1.0, transforms: list | None = None):
     """Optional Ultralytics default Albumentations hook for bbox-only labels."""
     if random.random() > p:
         return img, boxes, cls
@@ -266,9 +266,23 @@ def albumentations(img: np.ndarray, boxes: np.ndarray, cls: np.ndarray, p: float
         import albumentations as A
     except Exception:
         return img, boxes, cls
-    transforms = [A.Blur(p=0.01), A.MedianBlur(p=0.01), A.ToGray(p=0.01), A.CLAHE(p=0.01)]
-    transform = A.Compose(transforms)
-    return transform(image=img)["image"], boxes, cls
+    transforms = transforms or [A.Blur(p=0.01), A.MedianBlur(p=0.01), A.ToGray(p=0.01), A.CLAHE(p=0.01)]
+    try:
+        if len(boxes):
+            transform = A.Compose(
+                transforms,
+                bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"], min_visibility=0.01),
+            )
+            result = transform(image=img, bboxes=boxes.tolist(), class_labels=cls.reshape(-1).tolist())
+            out_boxes = np.asarray(result.get("bboxes", []), dtype=np.float32).reshape(-1, 4)
+            out_cls = np.asarray(result.get("class_labels", []), dtype=np.int64).reshape(-1)
+            if len(out_boxes) != len(out_cls):
+                return result["image"], boxes, cls
+            return result["image"], out_boxes.clip(0, 1), out_cls
+        transform = A.Compose(transforms)
+        return transform(image=img)["image"], boxes, cls
+    except Exception:
+        return img, boxes, cls
 
 
 def random_bgr(img: np.ndarray, p: float = 0.0) -> np.ndarray:
@@ -681,7 +695,7 @@ class Albumentations:
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         img, boxes, cls = _labels_to_arrays(labels)
-        labels["img"], boxes, cls = albumentations(img, boxes, cls, p=self.p)
+        labels["img"], boxes, cls = albumentations(img, boxes, cls, p=self.p, transforms=self.transforms)
         return _arrays_to_labels(labels, labels["img"], boxes, cls)
 
 

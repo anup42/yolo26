@@ -22,7 +22,7 @@ OUT_DIR="${YOLO26_COCO_OUT:-$ROOT_DIR/runs/train/yolo26n_tf_coco}"
 PROFILE="${YOLO26_COCO_PROFILE:-small}"
 TENSORFLOW_PACKAGE="${YOLO26_COCO_TENSORFLOW:-tensorflow[and-cuda]==2.15.1}"
 NUMPY_PACKAGE="${YOLO26_COCO_NUMPY:-numpy>=1.23.5,<2.0}"
-BATCH="${YOLO26_COCO_BATCH:-16}"
+BATCH="${YOLO26_COCO_BATCH:-96}"
 IMGSZ="${YOLO26_COCO_IMGSZ:-640}"
 SUBSET="${YOLO26_COCO_SUBSET:-100}"
 VAL_SUBSET="${YOLO26_COCO_VAL_SUBSET:-100}"
@@ -30,6 +30,13 @@ EPOCHS_SMALL="${YOLO26_COCO_EPOCHS_SMALL:-2}"
 EPOCHS_FULL="${YOLO26_COCO_EPOCHS_FULL:-300}"
 PROJECT="${YOLO26_COCO_PROJECT:-$OUT_DIR}"
 NAME="${YOLO26_COCO_NAME:-scratch_${PROFILE}}"
+CACHE_IMAGES="${YOLO26_COCO_CACHE_IMAGES:-auto}"
+CACHE_RAM_GB="${YOLO26_COCO_CACHE_RAM_GB:-32}"
+USE_TFRECORD="${YOLO26_COCO_USE_TFRECORD:-1}"
+COMPILE_STEP="${YOLO26_COCO_COMPILE:-1}"
+FAST_DATA="${YOLO26_COCO_FAST_DATA:-1}"
+FAST_NMS="${YOLO26_COCO_FAST_NMS:-1}"
+PROFILE_SPEED="${YOLO26_COCO_PROFILE_SPEED:-1}"
 
 mkdir -p "$OUT_DIR"
 LOG_FILE="${YOLO26_COCO_LOG:-$OUT_DIR/train_coco_yolo26n.log}"
@@ -126,12 +133,21 @@ if [[ ! -f "$DATA_DIR/annotations/instances_train2017.json" || ! -f "$DATA_DIR/a
   unzip -q "$DATA_DIR/annotations_trainval2017.zip" -d "$DATA_DIR"
 fi
 
-python "$ROOT_DIR/scripts/prepare_coco_yolo.py" \
-  --coco-root "$DATA_DIR" \
-  --output-yaml "$DATA_DIR/coco_yolo26.yaml" \
-  --train-subset "$SUBSET" \
-  --val-subset "$VAL_SUBSET" \
+PREPARE_ARGS=(
+  "$ROOT_DIR/scripts/prepare_coco_yolo.py"
+  --coco-root "$DATA_DIR"
+  --output-yaml "$DATA_DIR/coco_yolo26.yaml"
+  --train-subset "$SUBSET"
+  --val-subset "$VAL_SUBSET"
   --summary "$OUT_DIR/prepare_coco_summary.json"
+)
+if [[ "$USE_TFRECORD" == "0" ]]; then
+  PREPARE_ARGS+=(--no-tfrecord)
+fi
+if [[ "$PROFILE" == "full" ]]; then
+  PREPARE_ARGS+=(--full-tfrecord)
+fi
+python "${PREPARE_ARGS[@]}"
 
 if [[ "$PROFILE" == "full" ]]; then
   DATA_YAML="$DATA_DIR/coco_yolo26.yaml"
@@ -158,9 +174,16 @@ python -m yolo26_tf.cli detect train \
   --close-mosaic "${YOLO26_COCO_CLOSE_MOSAIC:-10}" \
   --workers "${YOLO26_COCO_WORKERS:-8}" \
   --cache \
+  --cache-images "$CACHE_IMAGES" \
+  --cache-ram-gb "$CACHE_RAM_GB" \
   --amp \
   --require-gpu \
-  --val-coco
+  --val-coco \
+  $([[ "$USE_TFRECORD" == "1" ]] && echo "--use-tfrecord" || echo "--no-tfrecord") \
+  $([[ "$COMPILE_STEP" == "1" ]] && echo "--compile" || echo "--no-compile") \
+  $([[ "$FAST_DATA" == "1" ]] && echo "--fast-data" || echo "--no-fast-data") \
+  $([[ "$FAST_NMS" == "1" ]] && echo "--fast-nms" || echo "--no-fast-nms") \
+  $([[ "$PROFILE_SPEED" == "1" ]] && echo "--profile-speed" || echo "--no-profile-speed")
 
 BEST="$PROJECT/$NAME/weights/best.weights.h5"
 python -m yolo26_tf.cli detect val \
@@ -174,6 +197,7 @@ python -m yolo26_tf.cli detect val \
   --max-det 300 \
   --coco \
   --save-json \
+  $([[ "$FAST_NMS" == "1" ]] && echo "--fast-nms" || echo "--no-fast-nms") \
   --project "$PROJECT/$NAME" \
   --name final_coco_val
 

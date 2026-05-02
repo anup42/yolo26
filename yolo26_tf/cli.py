@@ -32,6 +32,12 @@ def add_train_args(parser):
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--gpus")
     parser.add_argument("--cache", action="store_true")
+    parser.add_argument("--cache-images", default="auto", choices=("auto", "ram", "off"))
+    parser.add_argument("--cache-ram-gb", type=float, default=8.0)
+    parser.add_argument("--use-tfrecord", dest="use_tfrecord", action="store_true", default=True)
+    parser.add_argument("--no-tfrecord", dest="use_tfrecord", action="store_false")
+    parser.add_argument("--tfrecord-dir")
+    parser.add_argument("--rebuild-tfrecord", action="store_true")
     parser.add_argument("--rect", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--classes", default=None, help="Comma-separated class indexes to include.")
@@ -46,11 +52,22 @@ def add_train_args(parser):
     parser.add_argument("--val-coco", action="store_true")
     parser.add_argument("--save-period", type=int, default=-1)
     parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--compile", dest="compile_train_step", action="store_true", default=True)
+    parser.add_argument("--no-compile", dest="compile_train_step", action="store_false")
+    parser.add_argument("--fast-data", dest="fast_data", action="store_true", default=True)
+    parser.add_argument("--no-fast-data", dest="fast_data", action="store_false")
+    parser.add_argument("--fast-nms", dest="fast_nms", action="store_true", default=True)
+    parser.add_argument("--no-fast-nms", dest="fast_nms", action="store_false")
+    parser.add_argument("--profile-speed", dest="profile_speed", action="store_true", default=True)
+    parser.add_argument("--no-profile-speed", dest="profile_speed", action="store_false")
+    parser.add_argument("--profile-interval", type=int, default=0)
     parser.add_argument("--cls-pw", type=float, default=0.0)
     parser.add_argument("--mosaic", type=float, default=1.0)
+    parser.add_argument("--mosaic-n", type=int, default=4, choices=(3, 4, 9))
     parser.add_argument("--mixup", type=float, default=0.0)
     parser.add_argument("--cutmix", type=float, default=0.0)
     parser.add_argument("--copy-paste", type=float, default=0.0)
+    parser.add_argument("--copy-paste-mode", default="flip", choices=("flip", "mixup"))
     parser.add_argument("--degrees", type=float, default=0.0)
     parser.add_argument("--translate", type=float, default=0.1)
     parser.add_argument("--scale", type=float, default=0.5)
@@ -61,6 +78,7 @@ def add_train_args(parser):
     parser.add_argument("--hsv-v", type=float, default=0.4)
     parser.add_argument("--fliplr", type=float, default=0.5)
     parser.add_argument("--flipud", type=float, default=0.0)
+    parser.add_argument("--bgr", type=float, default=0.0)
 
 
 def main(argv=None):
@@ -88,8 +106,11 @@ def main(argv=None):
     val.add_argument("--save-conf", action="store_true")
     val.add_argument("--single-cls", action="store_true")
     val.add_argument("--agnostic-nms", action="store_true")
-    val.add_argument("--multi-label", action="store_true")
+    val.add_argument("--multi-label", dest="multi_label", action="store_true", default=True)
+    val.add_argument("--single-label", dest="multi_label", action="store_false")
     val.add_argument("--half", action="store_true")
+    val.add_argument("--fast-nms", dest="fast_nms", action="store_true", default=True)
+    val.add_argument("--no-fast-nms", dest="fast_nms", action="store_false")
     val.add_argument("--project", default="runs/detect")
     val.add_argument("--name", default="val")
 
@@ -102,6 +123,9 @@ def main(argv=None):
     pred.add_argument("--conf", type=float, default=0.25)
     pred.add_argument("--iou", type=float, default=0.45)
     pred.add_argument("--max-det", type=int, default=300)
+    pred.add_argument("--single-cls", action="store_true")
+    pred.add_argument("--agnostic-nms", action="store_true")
+    pred.add_argument("--multi-label", action="store_true")
 
     exp = detect_sub.add_parser("export")
     exp.add_argument("--model", default="yolo26n.yaml")
@@ -116,6 +140,7 @@ def main(argv=None):
     exp.add_argument("--dynamic", dest="dynamic", action="store_true", default=True)
     exp.add_argument("--static", dest="dynamic", action="store_false")
     exp.add_argument("--nms", action="store_true", help="Embed TensorFlow NMS in SavedModel/PB/TFLite exports.")
+    exp.add_argument("--agnostic-nms", action="store_true")
     exp.add_argument("--conf", type=float, default=0.25)
     exp.add_argument("--iou", type=float, default=0.45)
     exp.add_argument("--max-det", type=int, default=300)
@@ -163,6 +188,11 @@ def main(argv=None):
             workers=args.workers,
             gpus=args.gpus,
             cache=args.cache,
+            cache_images=args.cache_images,
+            cache_ram_gb=args.cache_ram_gb,
+            use_tfrecord=args.use_tfrecord,
+            tfrecord_dir=args.tfrecord_dir,
+            rebuild_tfrecord=args.rebuild_tfrecord,
             rect=args.rect,
             resume=args.resume,
             classes=parse_int_list(args.classes),
@@ -176,11 +206,18 @@ def main(argv=None):
             val_coco=args.val_coco,
             save_period=args.save_period,
             log_interval=args.log_interval,
+            compile_train_step=args.compile_train_step,
+            fast_data=args.fast_data,
+            fast_nms=args.fast_nms,
+            profile_speed=args.profile_speed,
+            profile_interval=args.profile_interval,
             cls_pw=args.cls_pw,
             mosaic=args.mosaic,
+            mosaic_n=args.mosaic_n,
             mixup=args.mixup,
             cutmix=args.cutmix,
             copy_paste=args.copy_paste,
+            copy_paste_mode=args.copy_paste_mode,
             degrees=args.degrees,
             translate=args.translate,
             scale=args.scale,
@@ -191,6 +228,7 @@ def main(argv=None):
             hsv_v=args.hsv_v,
             fliplr=args.fliplr,
             flipud=args.flipud,
+            bgr=args.bgr,
         )
     elif args.mode == "val":
         nc = args.nc if args.nc is not None else load_data_yaml(args.data)["nc"]
@@ -212,6 +250,7 @@ def main(argv=None):
             agnostic_nms=args.agnostic_nms,
             multi_label=args.multi_label,
             half=args.half,
+            fast_nms=args.fast_nms,
             project=args.project,
             name=args.name,
         )
@@ -225,7 +264,16 @@ def main(argv=None):
         y = YOLO26(args.model, nc=args.nc, imgsz=args.imgsz)
         if args.weights:
             y.model.load_weights(args.weights)
-        results = y.predict(args.source, imgsz=args.imgsz, conf=args.conf, iou=args.iou, max_det=args.max_det)
+        results = y.predict(
+            args.source,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            iou=args.iou,
+            max_det=args.max_det,
+            single_cls=args.single_cls,
+            agnostic_nms=args.agnostic_nms,
+            multi_label=args.multi_label,
+        )
         for r in results:
             print(r["path"], len(r["boxes"]), "detections")
     elif args.mode == "export":
@@ -242,6 +290,7 @@ def main(argv=None):
                 full_integer=args.full_integer,
                 dynamic=args.dynamic,
                 nms=args.nms,
+                agnostic_nms=args.agnostic_nms,
                 conf=args.conf,
                 iou=args.iou,
                 max_det=args.max_det,

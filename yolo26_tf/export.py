@@ -12,7 +12,17 @@ tf = require_tf()
 
 
 class ServingModule(tf.Module):
-    def __init__(self, model, imgsz: int = 640, dynamic: bool = True, nms: bool = False, conf: float = 0.25, iou: float = 0.45, max_det: int = 300):
+    def __init__(
+        self,
+        model,
+        imgsz: int = 640,
+        dynamic: bool = True,
+        nms: bool = False,
+        conf: float = 0.25,
+        iou: float = 0.45,
+        max_det: int = 300,
+        agnostic_nms: bool = False,
+    ):
         super().__init__()
         # Do not attach the Keras model as a trackable child. Keras 3 can keep
         # call metadata wrappers from training calls that break SavedModel object
@@ -25,7 +35,7 @@ class ServingModule(tf.Module):
         def serve(images):
             detections = model(images, training=False)
             if nms:
-                detections = tf_export_nms(detections, conf=conf, iou=iou, max_det=max_det)
+                detections = tf_export_nms(detections, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms)
             return {"detections": detections}
 
         self.serve = serve
@@ -38,6 +48,7 @@ def export_model(model, format: str = "keras", output: str | Path | None = None,
     conf = float(kwargs.get("conf", 0.25))
     iou = float(kwargs.get("iou", 0.45))
     max_det = int(kwargs.get("max_det", 300))
+    agnostic_nms = bool(kwargs.get("agnostic_nms", kwargs.get("agnostic", False)))
     if fmt in {"keras", "h5"}:
         path = output if output.suffix else output.with_suffix(".keras")
         try:
@@ -54,7 +65,16 @@ def export_model(model, format: str = "keras", output: str | Path | None = None,
     if fmt in {"saved_model", "savedmodel"}:
         path = output if not output.suffix else output.with_suffix("")
         path.parent.mkdir(parents=True, exist_ok=True)
-        module = ServingModule(model, imgsz=imgsz, dynamic=kwargs.get("dynamic", True), nms=nms, conf=conf, iou=iou, max_det=max_det)
+        module = ServingModule(
+            model,
+            imgsz=imgsz,
+            dynamic=kwargs.get("dynamic", True),
+            nms=nms,
+            conf=conf,
+            iou=iou,
+            max_det=max_det,
+            agnostic_nms=agnostic_nms,
+        )
         tf.saved_model.save(module, str(path), signatures={"serving_default": module.serve})
         if kwargs.get("verify", True):
             verify_saved_model(path, imgsz)
@@ -64,7 +84,7 @@ def export_model(model, format: str = "keras", output: str | Path | None = None,
         @tf.function(input_signature=[tf.TensorSpec([1, imgsz, imgsz, 3], tf.float32, name="images")])
         def serve(images):
             detections = model(images, training=False)
-            return tf_export_nms(detections, conf=conf, iou=iou, max_det=max_det) if nms else detections
+            return tf_export_nms(detections, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms) if nms else detections
 
         concrete = serve.get_concrete_function()
         converter = tf.lite.TFLiteConverter.from_concrete_functions([concrete], model)
@@ -91,7 +111,11 @@ def export_model(model, format: str = "keras", output: str | Path | None = None,
         from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2  # type: ignore
 
         shape = [None, None, None, 3] if kwargs.get("dynamic", False) else [None, imgsz, imgsz, 3]
-        func = tf.function(lambda x: tf_export_nms(model(x, training=False), conf=conf, iou=iou, max_det=max_det) if nms else model(x, training=False)).get_concrete_function(tf.TensorSpec(shape, tf.float32))
+        func = tf.function(
+            lambda x: tf_export_nms(model(x, training=False), conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms)
+            if nms
+            else model(x, training=False)
+        ).get_concrete_function(tf.TensorSpec(shape, tf.float32))
         frozen = convert_variables_to_constants_v2(func)
         path = output if output.suffix == ".pb" else output.with_suffix(".pb")
         tf.io.write_graph(frozen.graph, str(path.parent), path.name, as_text=False)
@@ -137,7 +161,7 @@ def representative_dataset(data, imgsz: int):
     return lambda: (normalize(x) for x in data)
 
 
-def tf_export_nms(pred, conf: float = 0.25, iou: float = 0.45, max_det: int = 300):
+def tf_export_nms(pred, conf: float = 0.25, iou: float = 0.45, max_det: int = 300, agnostic: bool = False):
     """TensorFlow-only NMS wrapper for export graphs.
 
     YOLO26 end-to-end heads usually already emit ``xyxy, conf, cls`` top-k rows;
@@ -153,8 +177,11 @@ def tf_export_nms(pred, conf: float = 0.25, iou: float = 0.45, max_det: int = 30
             boxes = p[:, :4]
             scores = p[:, 4]
             cls = p[:, 5]
-            offsets = cls[:, None] * 7680.0
-            boxes_for_nms = boxes + tf.concat([offsets, offsets, offsets, offsets], axis=-1)
+            if agnostic:
+                boxes_for_nms = boxes
+            else:
+                offsets = cls[:, None] * 7680.0
+                boxes_for_nms = boxes + tf.concat([offsets, offsets, offsets, offsets], axis=-1)
             idx = tf.image.non_max_suppression(boxes_for_nms, scores, max_output_size=max_det_t, iou_threshold=iou, score_threshold=conf)
             det = tf.gather(p, idx)
             pad = tf.maximum(max_det_t - tf.shape(det)[0], 0)
@@ -164,6 +191,18 @@ def tf_export_nms(pred, conf: float = 0.25, iou: float = 0.45, max_det: int = 30
         return tf.map_fn(one_image, pred, fn_output_signature=tf.TensorSpec([max_det, 6], tf.float32))
     boxes = pred[..., :4]
     scores = pred[..., 4:]
+    if agnostic:
+        score = tf.reduce_max(scores, axis=-1)
+        cls = tf.cast(tf.argmax(scores, axis=-1), tf.float32)
+
+        def one_image(args):
+            b, s, c = args
+            idx = tf.image.non_max_suppression(b, s, max_output_size=max_det, iou_threshold=iou, score_threshold=conf)
+            det = tf.concat([tf.gather(b, idx), tf.gather(s, idx)[:, None], tf.gather(c, idx)[:, None]], axis=-1)
+            pad = tf.maximum(tf.constant(max_det, dtype=tf.int32) - tf.shape(det)[0], 0)
+            return tf.pad(det, [[0, pad], [0, 0]])[:max_det]
+
+        return tf.map_fn(one_image, (boxes, score, cls), fn_output_signature=tf.TensorSpec([max_det, 6], tf.float32))
     nms_boxes, nms_scores, nms_classes, _valid = tf.image.combined_non_max_suppression(
         boxes=tf.expand_dims(boxes, axis=2),
         scores=scores,
