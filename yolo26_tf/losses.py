@@ -335,13 +335,26 @@ class E2ELoss:
 
     def __init__(self, model, hyp: dict | None = None):
         self.one2many = DetectionLoss(model, tal_topk=10, hyp=hyp)
-        self.one2one = DetectionLoss(model, tal_topk=1, hyp=hyp)
+        self.one2one = DetectionLoss(model, tal_topk=7, tal_topk2=1, hyp=hyp)
+        self.updates = 0
+        self.total = 1.0
+        self.o2m = 0.8
+        self.o2o = self.total - self.o2m
+        self.o2m_copy = self.o2m
+        self.final_o2m = 0.1
 
     def __call__(self, preds, batch):
         preds = preds[1] if isinstance(preds, tuple) else preds
         loss_m, items_m = self.one2many.loss(preds["one2many"], batch)
         loss_o, items_o = self.one2one.loss(preds["one2one"], batch)
-        return loss_m + loss_o, items_m + items_o
+        del items_m
+        return loss_m * self.o2m + loss_o * self.o2o, items_o
 
     def update(self):
-        return None
+        self.updates += 1
+        self.o2m = self.decay(self.updates)
+        self.o2o = max(self.total - self.o2m, 0.0)
+
+    def decay(self, x) -> float:
+        epochs = float(self.one2one.hyp.get("epochs", 100))
+        return max(1 - float(x) / max(epochs - 1, 1), 0.0) * (self.o2m_copy - self.final_o2m) + self.final_o2m

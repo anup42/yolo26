@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import random
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,7 +20,22 @@ import numpy as np
 import yaml
 from PIL import Image, ImageFile
 
-from .augment import albumentations, copy_paste_bbox_only, cutmix, mixup, random_bgr, random_flip, random_hsv, random_perspective
+from .augment import (
+    Albumentations,
+    Compose,
+    Format,
+    LetterBox,
+    albumentations,
+    copy_paste_bbox_only,
+    cutmix,
+    mixup,
+    random_bgr,
+    random_flip,
+    random_hsv,
+    random_perspective,
+    resample_segments,
+)
+from .instances import Instances
 from .ops import letterbox, xywh2xyxy_np, xyxy2xywh_np
 from .tf_import import require_tf
 
@@ -121,13 +137,13 @@ def verify_image_label(img: Path, nc: int | None = None) -> dict[str, Any]:
     except Exception as exc:
         return {"im_file": str(img), "shape": (0, 0), "cls": np.zeros((0,), np.int64), "bboxes": np.zeros((0, 4), np.float32), "ok": False, "msg": str(exc)}
 
-    cls, boxes, msg = read_label_file(img2label_path(img), nc=nc)
+    cls, boxes, segments, msg = read_label_file_with_segments(img2label_path(img), nc=nc)
     return {
         "im_file": str(img),
         "shape": shape,
         "cls": cls,
         "bboxes": boxes,
-        "segments": [],
+        "segments": segments,
         "normalized": True,
         "bbox_format": "xywh",
         "ok": True,
@@ -136,9 +152,23 @@ def verify_image_label(img: Path, nc: int | None = None) -> dict[str, Any]:
 
 
 def read_label_file(path: Path, nc: int | None = None) -> tuple[np.ndarray, np.ndarray, str]:
+    cls, boxes, _segments, msg = read_label_file_with_segments(path, nc=nc)
+    return cls, boxes, msg
+
+
+def segment2box(segment: np.ndarray) -> np.ndarray:
+    x = segment[:, 0].clip(0, 1)
+    y = segment[:, 1].clip(0, 1)
+    if len(x) == 0:
+        return np.zeros((4,), dtype=np.float32)
+    xyxy = np.array([x.min(), y.min(), x.max(), y.max()], dtype=np.float32)
+    return xyxy2xywh_np(xyxy[None])[0].clip(0, 1)
+
+
+def read_label_file_with_segments(path: Path, nc: int | None = None) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], str]:
     if not path.exists() or path.stat().st_size == 0:
-        return np.zeros((0,), dtype=np.int64), np.zeros((0, 4), dtype=np.float32), "empty"
-    rows = []
+        return np.zeros((0,), dtype=np.int64), np.zeros((0, 4), dtype=np.float32), [], "empty"
+    rows, segments = [], []
     bad = 0
     for line in path.read_text(encoding="utf-8").splitlines():
         parts = line.strip().split()
@@ -146,7 +176,7 @@ def read_label_file(path: Path, nc: int | None = None) -> tuple[np.ndarray, np.n
             bad += 1
             continue
         try:
-            row = [float(x) for x in parts[:5]]
+            row = [float(x) for x in parts]
         except ValueError:
             bad += 1
             continue
@@ -157,15 +187,39 @@ def read_label_file(path: Path, nc: int | None = None) -> tuple[np.ndarray, np.n
         if not np.isfinite(row).all():
             bad += 1
             continue
-        rows.append(row)
+        if len(row) > 6:
+            coords = np.asarray(row[1:], dtype=np.float32)
+            if len(coords) % 2:
+                bad += 1
+                continue
+            segment = coords.reshape(-1, 2).clip(0, 1)
+            box = segment2box(segment)
+            if box[2] <= 0 or box[3] <= 0:
+                bad += 1
+                continue
+            rows.append([float(c), *box.tolist()])
+            segments.append(segment)
+        else:
+            rows.append(row[:5])
+            segments.append(np.zeros((0, 2), dtype=np.float32))
     if not rows:
-        return np.zeros((0,), dtype=np.int64), np.zeros((0, 4), dtype=np.float32), f"bad={bad}"
+        return np.zeros((0,), dtype=np.int64), np.zeros((0, 4), dtype=np.float32), [], f"bad={bad}"
     arr = np.asarray(rows, dtype=np.float32)
     boxes = arr[:, 1:5].clip(0, 1)
     wh_ok = (boxes[:, 2] > 0) & (boxes[:, 3] > 0)
     arr = arr[wh_ok]
     boxes = boxes[wh_ok]
-    return arr[:, 0].astype(np.int64), boxes.astype(np.float32), f"bad={bad}"
+    segments = [s for s, keep in zip(segments, wh_ok) if keep]
+    if len(arr):
+        unique, idx = np.unique(arr[:, :5], axis=0, return_index=True)
+        idx = np.sort(idx)
+        arr = arr[idx]
+        boxes = boxes[idx]
+        segments = [segments[i] for i in idx]
+        dup = len(unique) != len(rows)
+        if dup:
+            bad += len(rows) - len(unique)
+    return arr[:, 0].astype(np.int64), boxes.astype(np.float32), segments, f"bad={bad}"
 
 
 class YOLODataset:
@@ -279,7 +333,7 @@ class YOLODataset:
                             "shape": tuple(item["shape"]),
                             "cls": np.asarray(item["cls"], dtype=np.int64),
                             "bboxes": np.asarray(item["bboxes"], dtype=np.float32),
-                            "segments": item.get("segments", []),
+                            "segments": [np.asarray(s, dtype=np.float32) for s in item.get("segments", [])],
                             "normalized": bool(item.get("normalized", True)),
                             "bbox_format": item.get("bbox_format", "xywh"),
                             "ok": bool(item["ok"]),
@@ -289,7 +343,8 @@ class YOLODataset:
                 return labels
             except Exception:
                 pass
-        labels = [verify_image_label(p, self.data["nc"]) for p in self.im_files]
+        with ThreadPoolExecutor(max_workers=min(8, max(len(self.im_files), 1))) as pool:
+            labels = list(pool.map(lambda p: verify_image_label(p, self.data["nc"]), self.im_files))
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             serial = []
@@ -300,7 +355,7 @@ class YOLODataset:
                         "shape": list(x["shape"]),
                         "cls": x["cls"].tolist(),
                         "bboxes": x["bboxes"].tolist(),
-                        "segments": [],
+                        "segments": [np.asarray(s, dtype=np.float32).tolist() for s in x.get("segments", [])],
                     }
                 )
             payload = {
@@ -325,13 +380,17 @@ class YOLODataset:
         for label in self.labels:
             cls = label["cls"].reshape(-1)
             boxes = label["bboxes"].reshape(-1, 4)
+            segments = list(label.get("segments", []))
             if self.classes is not None and len(cls):
                 keep = (cls.reshape(-1, 1) == self.classes).any(axis=1)
                 cls, boxes = cls[keep], boxes[keep]
+                if segments:
+                    segments = [s for s, k in zip(segments, keep) if k]
             if self.single_cls and len(cls):
                 cls = np.zeros_like(cls)
             label["cls"] = cls.astype(np.int64)
             label["bboxes"] = boxes.astype(np.float32)
+            label["segments"] = segments
 
     def _build_rect_batch_shapes(self, stride: int = 32, pad: float = 0.5):
         shapes = np.asarray([x["shape"] for x in self.labels], dtype=np.float32)  # h, w
@@ -358,8 +417,36 @@ class YOLODataset:
 
     def close_mosaic(self):
         self.hyp["mosaic"] = 0.0
+        self.hyp["copy_paste"] = 0.0
         self.hyp["mixup"] = 0.0
         self.hyp["cutmix"] = 0.0
+
+    def build_transforms(self, hyp: dict | None = None) -> Compose:
+        hyp = {**self.hyp, **(hyp or {})}
+        transforms = [LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment)]
+        if self.augment:
+            transforms.append(Albumentations(p=1.0))
+        transforms.append(Format(bbox_format="xywh", normalize=True, batch_idx=True, bgr=hyp.get("bgr", 0.0) if self.augment else 0.0))
+        return Compose(transforms)
+
+    def update_labels_info(self, label: dict) -> dict:
+        label = dict(label)
+        bboxes = np.asarray(label.pop("bboxes", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32).reshape(-1, 4)
+        segments = label.pop("segments", [])
+        if len(segments):
+            max_len = max(len(s) for s in segments)
+            n = max(max_len + 1, 1000) if max_len >= 1000 else 1000
+            segments = np.stack(resample_segments(segments, n=n), axis=0)
+        else:
+            segments = np.zeros((0, 1000, 2), dtype=np.float32)
+        label["instances"] = Instances(bboxes, segments, bbox_format=label.pop("bbox_format", "xywh"), normalized=label.pop("normalized", True))
+        return label
+
+    def get_image_and_label(self, idx: int) -> dict:
+        img, boxes, cls, path, shape, ratio, pad = self.load_one(idx)
+        label = dict(self.labels[idx])
+        label.update({"img": img, "cls": cls, "bboxes": boxes, "im_file": path, "ori_shape": shape, "ratio_pad": (ratio, pad)})
+        return self.update_labels_info(label)
 
     def read_label(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
         cls, boxes, _ = read_label_file(img2label_path(path), nc=self.data.get("nc"))
@@ -513,6 +600,37 @@ class YOLODataset:
             "ratio": [s[5] for s in samples],
             "pad": [s[6] for s in samples],
         }
+
+    @staticmethod
+    def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
+        """Ultralytics-style collate for per-sample formatted labels.
+
+        This is used by parity tests and external callers that build transforms
+        with ``get_image_and_label``/``Format`` rather than the internal batched
+        iterator. The trainer still uses ``__getitem__`` for efficient padded
+        numpy batches.
+        """
+        if not batch:
+            raise ValueError("collate_fn received an empty batch")
+        imgs = np.stack([np.asarray(x["img"], dtype=np.float32) for x in batch], axis=0)
+        bboxes, cls, batch_idx = [], [], []
+        for i, sample in enumerate(batch):
+            boxes_i = np.asarray(sample.get("bboxes", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32).reshape(-1, 4)
+            cls_i = np.asarray(sample.get("cls", np.zeros((len(boxes_i),), dtype=np.int64)), dtype=np.int64).reshape(-1, 1)
+            if len(boxes_i):
+                bboxes.append(boxes_i)
+                cls.append(cls_i)
+                batch_idx.append(np.full((len(boxes_i), 1), i, dtype=np.float32))
+        out = {
+            "img": imgs,
+            "bboxes": np.concatenate(bboxes, axis=0) if bboxes else np.zeros((0, 4), dtype=np.float32),
+            "cls": np.concatenate(cls, axis=0) if cls else np.zeros((0, 1), dtype=np.int64),
+            "batch_idx": np.concatenate(batch_idx, axis=0) if batch_idx else np.zeros((0, 1), dtype=np.float32),
+            "im_file": [x.get("im_file", "") for x in batch],
+            "ori_shape": [x.get("ori_shape") for x in batch],
+            "ratio_pad": [x.get("ratio_pad") for x in batch],
+        }
+        return out
 
     def numeric_batches(self):
         for b in self:

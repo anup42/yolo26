@@ -116,6 +116,7 @@ class YOLO26:
             save_conf=kwargs.get("save_conf", False),
             single_cls=kwargs.get("single_cls", False),
             agnostic_nms=kwargs.get("agnostic_nms", False),
+            multi_label=kwargs.get("multi_label", False),
             half=kwargs.get("half", False),
             project=project,
             name=name,

@@ -164,3 +164,63 @@ def targets_from_batch(batch: dict, img_shape: int | tuple[int, int]) -> list[tu
             xyxy = np.zeros((0, 4), dtype=np.float32)
         out.append((cls.astype(np.int64), xyxy.astype(np.float32)))
     return out
+
+
+class DetMetrics:
+    """Ultralytics-like detection metric accumulator.
+
+    The public keys intentionally match ``DetectionValidator`` result names so
+    training logs and benchmark JSONs can be compared directly against
+    Ultralytics output. Curve arrays are kept lightweight but available for
+    downstream plotting/tests.
+    """
+
+    keys = ("metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)")
+
+    def __init__(self, names: dict[int, str] | None = None):
+        self.names = names or {}
+        self.nt_per_class: dict[int, int] = {}
+        self.ap_class_index: list[int] = []
+        self.results_dict = empty_metrics()
+        self.curves_results: dict[str, list] = {}
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
+        self.clear_stats()
+
+    def clear_stats(self):
+        self.preds: list[np.ndarray] = []
+        self.targets: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def update_stats(self, preds: list[np.ndarray], targets: list[tuple[np.ndarray, np.ndarray]]):
+        self.preds.extend(preds)
+        self.targets.extend(targets)
+
+    def process(self) -> dict:
+        self.results_dict = ap_per_class(self.preds, self.targets)
+        self.nt_per_class = self.results_dict.get("nt_per_class", {})
+        self.ap_class_index = self.results_dict.get("ap_class_index", [])
+        self.curves_results = {
+            "names": [self.names.get(i, str(i)) for i in self.ap_class_index],
+            "ap_class_index": list(self.ap_class_index),
+        }
+        return self.results_dict
+
+    @property
+    def fitness(self) -> float:
+        return float(self.results_dict.get("fitness", self.results_dict.get("metrics/mAP50-95(B)", 0.0)))
+
+    def mean_results(self) -> list[float]:
+        return [float(self.results_dict.get(k, 0.0)) for k in self.keys]
+
+    def class_result(self, i: int) -> tuple[float, float, float, float]:
+        cls_id = int(self.ap_class_index[i])
+        if self.nt_per_class.get(cls_id, 0) == 0:
+            return 0.0, 0.0, 0.0, 0.0
+        return tuple(self.mean_results())
+
+    def summary(self, normalize: bool = True, decimals: int = 5) -> list[dict]:
+        rows = []
+        for cls_id in self.ap_class_index:
+            row = {"Class": self.names.get(int(cls_id), str(cls_id)), "Images": len(self.targets), "Instances": self.nt_per_class.get(int(cls_id), 0)}
+            row.update({k: round(float(self.results_dict.get(k, 0.0)), decimals) for k in self.keys})
+            rows.append(row)
+        return rows

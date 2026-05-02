@@ -3,7 +3,7 @@ import pytest
 
 from yolo26_tf.losses import TaskAlignedAssigner
 from yolo26_tf.optim import make_optimizer
-from yolo26_tf.trainer import resolve_optimizer_auto
+from yolo26_tf.trainer import resolve_optimizer_auto, variable_decay_group
 
 
 def test_optimizer_auto_matches_ultralytics_defaults():
@@ -16,6 +16,16 @@ def test_musgd_defaults_match_ultralytics_coefficients():
     opt = make_optimizer("musgd", lr=0.01, momentum=0.9, weight_decay=0.0, iterations=10001)
     assert opt.muon == 0.2
     assert opt.sgd == 1.0
+
+
+def test_variable_decay_group_matches_bias_norm_decay_split():
+    tf = pytest.importorskip("tensorflow")
+    kernel = tf.Variable(np.ones((3, 3, 1, 4), dtype=np.float32), name="conv/kernel")
+    bias = tf.Variable(np.ones((4,), dtype=np.float32), name="conv/bias")
+    norm = tf.Variable(np.ones((4,), dtype=np.float32), name="batch_normalization/gamma")
+    assert variable_decay_group(kernel) == "decay"
+    assert variable_decay_group(bias) == "bias"
+    assert variable_decay_group(norm) == "norm"
 
 
 def test_task_aligned_assigner_matches_ultralytics_small_box_behavior():

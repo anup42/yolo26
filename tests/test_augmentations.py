@@ -3,7 +3,7 @@ import random
 import numpy as np
 
 from scripts.make_tiny_dataset import create_tiny_dataset
-from yolo26_tf.augment import Format, LetterBox, copy_paste_segments
+from yolo26_tf.augment import Compose, Format, LetterBox, Mosaic, RandomFlip, RandomHSV, copy_paste_segments, resample_segments
 from yolo26_tf.data import YOLODataset
 from yolo26_tf.instances import Instances
 
@@ -72,3 +72,43 @@ def test_copy_paste_segments_smoke():
     assert out.shape == img.shape
     assert len(merged) >= 1
     assert cls.shape[0] == len(merged)
+
+
+def test_ultralytics_style_transform_and_collate_contract(tmp_path):
+    data_yaml = create_tiny_dataset(tmp_path / "tiny_collate", n=2, size=32)
+    ds = YOLODataset(data_yaml, split="train", imgsz=32, batch=2, augment=False, shuffle=False)
+    transforms = Compose(
+        [
+            LetterBox(new_shape=(32, 32), scaleup=True),
+            RandomHSV(0.0, 0.0, 0.0),
+            RandomFlip(p=0.0),
+            Format(bbox_format="xywh", normalize=True, batch_idx=True),
+        ]
+    )
+    samples = [transforms(ds.get_image_and_label(i)) for i in range(2)]
+    batch = YOLODataset.collate_fn(samples)
+    assert batch["img"].shape == (2, 32, 32, 3)
+    assert batch["bboxes"].ndim == 2
+    assert batch["cls"].shape[0] == batch["bboxes"].shape[0]
+    assert batch["batch_idx"].shape == (batch["bboxes"].shape[0], 1)
+
+
+def test_resample_segments_fixed_count():
+    segment = np.array([[0, 0], [1, 0], [1, 1]], dtype=np.float32)
+    out = resample_segments([segment], n=8)[0]
+    assert out.shape == (8, 2)
+    assert np.isfinite(out).all()
+
+
+def test_mosaic_transform_supports_3_4_9(tmp_path):
+    data_yaml = create_tiny_dataset(tmp_path / "tiny_mosaic_modes", n=9, size=32)
+    ds = YOLODataset(data_yaml, split="train", imgsz=32, batch=1, augment=False, shuffle=False)
+    base = ds.get_image_and_label(0)
+    for n in (3, 4, 9):
+        random.seed(0)
+        labels = Mosaic(ds, imgsz=32, p=1.0, n=n)(dict(base))
+        labels = Format(bbox_format="xywh", normalize=True, batch_idx=True)(labels)
+        assert labels["img"].shape == (64, 64, 3)
+        assert labels["bboxes"].ndim == 2
+        assert (labels["bboxes"] >= 0).all()
+        assert (labels["bboxes"] <= 1).all()

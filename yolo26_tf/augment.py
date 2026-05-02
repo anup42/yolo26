@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import math
 import random
+from copy import deepcopy
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -276,6 +278,24 @@ def random_bgr(img: np.ndarray, p: float = 0.0) -> np.ndarray:
     return img
 
 
+def resample_segments(segments: list[np.ndarray], n: int = 1000) -> list[np.ndarray]:
+    """Resample polygon segments to a fixed point count like Ultralytics Format."""
+    out = []
+    for segment in segments:
+        segment = np.asarray(segment, dtype=np.float32).reshape(-1, 2)
+        if len(segment) == 0:
+            out.append(np.zeros((n, 2), dtype=np.float32))
+            continue
+        if len(segment) == 1:
+            out.append(np.repeat(segment, n, axis=0).astype(np.float32))
+            continue
+        closed = np.concatenate([segment, segment[:1]], axis=0)
+        x = np.linspace(0, len(closed) - 1, n, endpoint=False)
+        xp = np.arange(len(closed), dtype=np.float32)
+        out.append(np.stack([np.interp(x, xp, closed[:, 0]), np.interp(x, xp, closed[:, 1])], axis=1).astype(np.float32))
+    return out
+
+
 class Compose:
     """Sequential transform container compatible with Ultralytics augmentation flow."""
 
@@ -288,17 +308,388 @@ class Compose:
     def insert(self, index: int, transform):
         self.transforms.insert(index, transform)
 
+    def __getitem__(self, index):
+        return self.transforms[index]
+
+    def __setitem__(self, index, value):
+        self.transforms[index] = value
+
+    def tolist(self):
+        return self.transforms
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.transforms})"
+
     def __call__(self, labels):
         for transform in self.transforms:
             labels = transform(labels)
         return labels
 
 
+class BaseTransform:
+    """Ultralytics-compatible base transform for label dictionaries."""
+
+    def apply_image(self, labels: dict[str, Any]):
+        return labels
+
+    def apply_instances(self, labels: dict[str, Any]):
+        return labels
+
+    def apply_semantic(self, labels: dict[str, Any]):
+        return labels
+
+    def __call__(self, labels: dict[str, Any]):
+        labels = self.apply_image(labels)
+        labels = self.apply_instances(labels)
+        return self.apply_semantic(labels)
+
+
+class BaseMixTransform:
+    """Ultralytics-style mix transform base for Mosaic/MixUp/CutMix/CopyPaste."""
+
+    def __init__(self, dataset=None, pre_transform=None, p: float = 0.0):
+        self.dataset = dataset
+        self.pre_transform = pre_transform
+        self.p = float(p)
+
+    def get_indexes(self):
+        if self.dataset is None:
+            return []
+        return random.randint(0, len(self.dataset.im_files) - 1)
+
+    def _mix_transform(self, labels: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - abstract compatibility hook
+        raise NotImplementedError
+
+    def _update_label_text(self, labels: dict[str, Any]) -> dict[str, Any]:
+        return labels
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if random.uniform(0, 1) > self.p or self.dataset is None:
+            return labels
+        indexes = self.get_indexes()
+        if isinstance(indexes, int):
+            indexes = [indexes]
+        mix_labels = [self.dataset.get_image_and_label(i) for i in indexes]
+        if self.pre_transform is not None:
+            mix_labels = [self.pre_transform(x) for x in mix_labels]
+        labels["mix_labels"] = mix_labels
+        labels = self._update_label_text(labels)
+        labels = self._mix_transform(labels)
+        labels.pop("mix_labels", None)
+        return labels
+
+
+def _labels_to_arrays(labels: dict[str, Any]):
+    img = labels["img"]
+    cls = np.asarray(labels.get("cls", np.zeros((0,), dtype=np.int64))).reshape(-1).astype(np.int64)
+    instances = labels.get("instances")
+    if instances is None:
+        boxes = np.asarray(labels.get("bboxes", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32).reshape(-1, 4)
+    else:
+        inst = deepcopy(instances)
+        inst.convert_bbox("xywh")
+        if not inst.normalized:
+            inst.normalize(img.shape[1], img.shape[0])
+        boxes = inst.bboxes.astype(np.float32)
+    return img, boxes, cls
+
+
+def _arrays_to_labels(labels: dict[str, Any], img, boxes, cls):
+    labels["img"] = img
+    labels["cls"] = np.asarray(cls, dtype=np.int64).reshape(-1)
+    labels["instances"] = Instances(np.asarray(boxes, dtype=np.float32).reshape(-1, 4), bbox_format="xywh", normalized=True)
+    return labels
+
+
+class Mosaic(BaseMixTransform):
+    """Mosaic augmentation supporting Ultralytics n=3/4/9 constructor contract."""
+
+    def __init__(self, dataset, imgsz: int = 640, p: float = 1.0, n: int = 4):
+        super().__init__(dataset=dataset, pre_transform=None, p=p)
+        if n not in {3, 4, 9}:
+            raise ValueError("Mosaic n must be one of {3, 4, 9}.")
+        self.imgsz = int(imgsz)
+        self.n = int(n)
+
+    def get_indexes(self):
+        count = self.n - 1
+        return random.choices(range(len(self.dataset.im_files)), k=count)
+
+    def _mix_transform(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if self.n == 3:
+            return self._mosaic3(labels)
+        if self.n == 9:
+            return self._mosaic9(labels)
+        return self._mosaic4(labels)
+
+    def _mosaic4(self, labels: dict[str, Any]) -> dict[str, Any]:
+        mix = [labels, *labels.get("mix_labels", [])]
+        while len(mix) < 4:
+            mix.append(deepcopy(mix[-1]))
+        size = self.imgsz
+        out = np.full((size * 2, size * 2, 3), 114, dtype=np.uint8)
+        all_boxes, all_cls = [], []
+        xc = random.randint(size // 2, size * 3 // 2)
+        yc = random.randint(size // 2, size * 3 // 2)
+        for i, lb in enumerate(mix[:4]):
+            img, boxes, cls = _labels_to_arrays(lb)
+            h, w = img.shape[:2]
+            if i == 0:
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+            elif i == 1:
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, size * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(size * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            else:
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, size * 2), min(size * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+            out[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+            if len(boxes):
+                xyxy = xywh2xyxy_np(boxes)
+                xyxy[:, [0, 2]] = xyxy[:, [0, 2]] * w + x1a - x1b
+                xyxy[:, [1, 3]] = xyxy[:, [1, 3]] * h + y1a - y1b
+                xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clip(0, size * 2)
+                xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clip(0, size * 2)
+                b = xyxy2xywh_np(xyxy)
+                b[:, [0, 2]] /= size * 2
+                b[:, [1, 3]] /= size * 2
+                keep = (b[:, 2] > 0) & (b[:, 3] > 0)
+                if keep.any():
+                    all_boxes.append(b[keep].clip(0, 1))
+                    all_cls.append(cls[keep])
+        boxes = np.concatenate(all_boxes, axis=0) if all_boxes else np.zeros((0, 4), dtype=np.float32)
+        cls = np.concatenate(all_cls, axis=0) if all_cls else np.zeros((0,), dtype=np.int64)
+        labels = _arrays_to_labels(labels, out, boxes, cls)
+        labels["mosaic_border"] = (-size // 2, -size // 2)
+        return labels
+
+    def _mosaic3(self, labels: dict[str, Any]) -> dict[str, Any]:
+        mix = [labels, *labels.get("mix_labels", [])]
+        while len(mix) < 3:
+            mix.append(deepcopy(mix[-1]))
+        s = self.imgsz
+        canvas = None
+        all_boxes, all_cls = [], []
+        crop_x = crop_y = s // 2
+        h0 = w0 = 0
+        for i, lb in enumerate(mix[:3]):
+            img, boxes, cls = _labels_to_arrays(lb)
+            h, w = img.shape[:2]
+            if canvas is None:
+                canvas = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=img.dtype)
+            if i == 0:
+                h0, w0 = h, w
+                c = (s, s, s + w, s + h)
+            elif i == 1:
+                c = (s + w0, s, s + w0 + w, s + h)
+            else:
+                c = (s - w, s + h0 - h, s, s + h0)
+            self._paste_on_canvas(canvas, img, boxes, cls, c, crop_x, crop_y, all_boxes, all_cls)
+        out = canvas[crop_y : crop_y + 2 * s, crop_x : crop_x + 2 * s]
+        boxes = np.concatenate(all_boxes, axis=0) if all_boxes else np.zeros((0, 4), dtype=np.float32)
+        cls = np.concatenate(all_cls, axis=0) if all_cls else np.zeros((0,), dtype=np.int64)
+        labels = _arrays_to_labels(labels, out, boxes, cls)
+        labels["mosaic_border"] = (-s // 2, -s // 2)
+        return labels
+
+    def _mosaic9(self, labels: dict[str, Any]) -> dict[str, Any]:
+        mix = [labels, *labels.get("mix_labels", [])]
+        while len(mix) < 9:
+            mix.append(deepcopy(mix[-1]))
+        s = self.imgsz
+        canvas = None
+        all_boxes, all_cls = [], []
+        crop_x = crop_y = s // 2
+        h0 = w0 = hp = wp = 0
+        for i, lb in enumerate(mix[:9]):
+            img, boxes, cls = _labels_to_arrays(lb)
+            h, w = img.shape[:2]
+            if canvas is None:
+                canvas = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=img.dtype)
+            if i == 0:
+                h0, w0 = h, w
+                c = (s, s, s + w, s + h)
+            elif i == 1:
+                c = (s, s - h, s + w, s)
+            elif i == 2:
+                c = (s + wp, s - h, s + wp + w, s)
+            elif i == 3:
+                c = (s + w0, s, s + w0 + w, s + h)
+            elif i == 4:
+                c = (s + w0, s + hp, s + w0 + w, s + hp + h)
+            elif i == 5:
+                c = (s + w0 - w, s + h0, s + w0, s + h0 + h)
+            elif i == 6:
+                c = (s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h)
+            elif i == 7:
+                c = (s - w, s + h0 - h, s, s + h0)
+            else:
+                c = (s - w, s + h0 - hp - h, s, s + h0 - hp)
+            self._paste_on_canvas(canvas, img, boxes, cls, c, crop_x, crop_y, all_boxes, all_cls)
+            hp, wp = h, w
+        out = canvas[crop_y : crop_y + 2 * s, crop_x : crop_x + 2 * s]
+        boxes = np.concatenate(all_boxes, axis=0) if all_boxes else np.zeros((0, 4), dtype=np.float32)
+        cls = np.concatenate(all_cls, axis=0) if all_cls else np.zeros((0,), dtype=np.int64)
+        labels = _arrays_to_labels(labels, out, boxes, cls)
+        labels["mosaic_border"] = (-s // 2, -s // 2)
+        return labels
+
+    @staticmethod
+    def _paste_on_canvas(canvas, img, boxes, cls, coords, crop_x, crop_y, all_boxes, all_cls):
+        padw, padh = coords[:2]
+        x1, y1, x2, y2 = [max(int(x), 0) for x in coords]
+        x2 = min(x2, canvas.shape[1])
+        y2 = min(y2, canvas.shape[0])
+        if x2 <= x1 or y2 <= y1:
+            return
+        canvas[y1:y2, x1:x2] = img[y1 - padh : y2 - padh, x1 - padw : x2 - padw]
+        if len(boxes):
+            h, w = img.shape[:2]
+            final = canvas.shape[0] - crop_y * 2
+            xyxy = xywh2xyxy_np(boxes)
+            xyxy[:, [0, 2]] = xyxy[:, [0, 2]] * w + padw - crop_x
+            xyxy[:, [1, 3]] = xyxy[:, [1, 3]] * h + padh - crop_y
+            xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clip(0, final)
+            xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clip(0, final)
+            b = xyxy2xywh_np(xyxy)
+            b[:, [0, 2]] /= final
+            b[:, [1, 3]] /= final
+            keep = (b[:, 2] > 0) & (b[:, 3] > 0)
+            if keep.any():
+                all_boxes.append(b[keep].clip(0, 1))
+                all_cls.append(cls[keep])
+
+
+class MixUp(BaseMixTransform):
+    def _mix_transform(self, labels: dict[str, Any]) -> dict[str, Any]:
+        img1, boxes1, cls1 = _labels_to_arrays(labels)
+        img2, boxes2, cls2 = _labels_to_arrays(labels["mix_labels"][0])
+        return _arrays_to_labels(labels, *mixup(img1, boxes1, cls1, img2, boxes2, cls2))
+
+
+class CutMix(BaseMixTransform):
+    def _mix_transform(self, labels: dict[str, Any]) -> dict[str, Any]:
+        img1, boxes1, cls1 = _labels_to_arrays(labels)
+        img2, boxes2, cls2 = _labels_to_arrays(labels["mix_labels"][0])
+        return _arrays_to_labels(labels, *cutmix(img1, boxes1, cls1, img2, boxes2, cls2))
+
+
+class CopyPaste(BaseMixTransform):
+    def __init__(self, dataset=None, pre_transform=None, p: float = 0.5, mode: str = "flip"):
+        super().__init__(dataset=dataset, pre_transform=pre_transform, p=p)
+        if mode not in {"flip", "mixup"}:
+            raise ValueError("CopyPaste mode must be 'flip' or 'mixup'.")
+        self.mode = mode
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if self.mode == "flip" or self.dataset is None:
+            img, instances, cls = copy_paste_segments(labels["img"], labels["instances"], labels.get("cls", np.zeros((0,), dtype=np.int64)), self.p)
+            labels["img"], labels["instances"], labels["cls"] = img, instances, cls
+            return labels
+        return super().__call__(labels)
+
+    def _mix_transform(self, labels: dict[str, Any]) -> dict[str, Any]:
+        labels2 = labels["mix_labels"][0]
+        if "instances" not in labels2:
+            return labels
+        img, inst, cls = copy_paste_segments(labels2["img"], labels2["instances"], labels2.get("cls", np.zeros((0,), dtype=np.int64)), self.p)
+        labels2 = {"img": img, "instances": inst, "cls": cls}
+        img1, boxes1, cls1 = _labels_to_arrays(labels)
+        img2, boxes2, cls2 = _labels_to_arrays(labels2)
+        return _arrays_to_labels(labels, *mixup(img1, boxes1, cls1, img2, boxes2, cls2, alpha=32.0))
+
+
+class RandomPerspective:
+    def __init__(
+        self,
+        degrees: float = 0.0,
+        translate: float = 0.1,
+        scale: float = 0.5,
+        shear: float = 0.0,
+        perspective: float = 0.0,
+        border: tuple[int, int] = (0, 0),
+        pre_transform=None,
+    ):
+        self.degrees = degrees
+        self.translate = translate
+        self.scale = scale
+        self.shear = shear
+        self.perspective = perspective
+        self.border = border
+        self.pre_transform = pre_transform
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if self.pre_transform is not None:
+            labels = self.pre_transform(labels)
+        img, boxes, cls = _labels_to_arrays(labels)
+        img, boxes, cls = random_perspective(img, boxes, cls, self.degrees, self.translate, self.scale, self.shear, self.perspective, self.border)
+        return _arrays_to_labels(labels, img, boxes, cls)
+
+    @staticmethod
+    def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.10, eps=1e-16):
+        return box_candidates(box1, box2, wh_thr, ar_thr, area_thr, eps)
+
+
+class RandomHSV:
+    def __init__(self, hgain=0.5, sgain=0.5, vgain=0.5):
+        self.hgain, self.sgain, self.vgain = hgain, sgain, vgain
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        labels["img"] = random_hsv(labels["img"], self.hgain, self.sgain, self.vgain)
+        return labels
+
+
+class RandomFlip:
+    def __init__(self, p: float = 0.5, direction: str = "horizontal", flip_idx: list[int] | None = None):
+        if direction not in {"horizontal", "vertical"}:
+            raise ValueError("direction must be 'horizontal' or 'vertical'.")
+        self.p = float(p)
+        self.direction = direction
+        self.flip_idx = flip_idx
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        img = labels["img"]
+        instances = labels.get("instances")
+        if instances is None:
+            boxes = np.asarray(labels.get("bboxes", np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)
+            img, boxes = random_flip(img, boxes, fliplr=self.p if self.direction == "horizontal" else 0.0, flipud=self.p if self.direction == "vertical" else 0.0)
+            labels["img"], labels["bboxes"] = img, boxes
+            return labels
+        instances.convert_bbox("xywh")
+        h, w = img.shape[:2]
+        h = 1 if instances.normalized else h
+        w = 1 if instances.normalized else w
+        if self.direction == "vertical" and random.random() < self.p:
+            labels["img"] = np.ascontiguousarray(np.flipud(img))
+            instances.flipud(h)
+        if self.direction == "horizontal" and random.random() < self.p:
+            labels["img"] = np.ascontiguousarray(np.fliplr(labels["img"]))
+            instances.fliplr(w)
+        labels["instances"] = instances
+        return labels
+
+
+class Albumentations:
+    def __init__(self, p: float = 1.0, transforms: list | None = None):
+        self.p = float(p)
+        self.transforms = transforms
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        img, boxes, cls = _labels_to_arrays(labels)
+        labels["img"], boxes, cls = albumentations(img, boxes, cls, p=self.p)
+        return _arrays_to_labels(labels, labels["img"], boxes, cls)
+
+
 class LetterBox:
     """Label-aware letterbox transform mirroring Ultralytics detection behavior."""
 
-    def __init__(self, new_shape=(640, 640), scaleup=True, center=True, stride=32, padding_value=114):
+    def __init__(self, new_shape=(640, 640), auto=False, scale_fill=False, scaleup=True, center=True, stride=32, padding_value=114):
         self.new_shape = new_shape
+        self.auto = bool(auto)
+        self.scale_fill = bool(scale_fill)
         self.scaleup = scaleup
         self.center = center
         self.stride = stride
@@ -307,10 +698,42 @@ class LetterBox:
     def __call__(self, labels=None, image=None):
         labels = {} if labels is None else labels
         img = labels.get("img") if image is None else image
-        img, ratio, pad = letterbox(img, self.new_shape, color=(self.padding_value,) * 3, scaleup=self.scaleup)
-        if not self.center and pad != (0, 0):
-            # The port currently only needs centered letterbox for YOLO26 train/val.
-            raise NotImplementedError("LetterBox(center=False) is not supported in yolo26_tf.")
+        if isinstance(self.new_shape, int):
+            new_shape = (self.new_shape, self.new_shape)
+        else:
+            new_shape = tuple(self.new_shape)
+        shape = img.shape[:2]
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        if not self.scaleup:
+            r = min(r, 1.0)
+        ratio = (r, r)
+        new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        if self.auto:
+            dw, dh = np.mod(dw, self.stride), np.mod(dh, self.stride)
+        elif self.scale_fill:
+            dw, dh = 0.0, 0.0
+            new_unpad = (new_shape[1], new_shape[0])
+            ratio = (new_shape[1] / shape[1], new_shape[0] / shape[0])
+        if self.center:
+            dw /= 2
+            dh /= 2
+        if shape[::-1] != new_unpad:
+            if cv2 is not None:
+                img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+            else:  # pragma: no cover
+                from PIL import Image
+
+                img = np.asarray(Image.fromarray(img).resize(new_unpad, Image.BILINEAR))
+        top = int(round(dh - 0.1)) if self.center else 0
+        bottom = int(round(dh + 0.1))
+        left = int(round(dw - 0.1)) if self.center else 0
+        right = int(round(dw + 0.1))
+        if cv2 is not None:
+            img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(self.padding_value,) * 3)
+        else:  # pragma: no cover
+            img = np.pad(img, ((top, bottom), (left, right), (0, 0)), mode="constant", constant_values=self.padding_value)
+        pad = (left, top)
         if not labels:
             return img
         if "instances" in labels:
@@ -328,11 +751,27 @@ class LetterBox:
 class Format:
     """Format labels into the TensorFlow port's normalized HWC detection contract."""
 
-    def __init__(self, bbox_format="xywh", normalize=True, batch_idx=True, bgr=0.0):
+    def __init__(
+        self,
+        bbox_format="xywh",
+        normalize=True,
+        batch_idx=True,
+        bgr=0.0,
+        return_mask=False,
+        return_keypoint=False,
+        return_obb=False,
+        mask_ratio=4,
+        mask_overlap=True,
+    ):
         self.bbox_format = bbox_format
         self.normalize = bool(normalize)
         self.batch_idx = bool(batch_idx)
         self.bgr = float(bgr)
+        self.return_mask = bool(return_mask)
+        self.return_keypoint = bool(return_keypoint)
+        self.return_obb = bool(return_obb)
+        self.mask_ratio = int(mask_ratio)
+        self.mask_overlap = bool(mask_overlap)
 
     def __call__(self, labels):
         img = random_bgr(labels["img"], self.bgr)
@@ -348,6 +787,10 @@ class Format:
         labels["cls"] = np.asarray(labels.get("cls", np.zeros((len(instances),), dtype=np.int64))).reshape(-1).astype(np.int64)
         if self.batch_idx:
             labels["batch_idx"] = np.zeros((len(instances), 1), dtype=np.float32)
+        if self.return_keypoint and instances.keypoints is not None:
+            labels["keypoints"] = instances.keypoints.astype(np.float32)
+        if self.return_mask:
+            labels["segments"] = instances.segments.astype(np.float32)
         return labels
 
 

@@ -35,3 +35,20 @@ def test_loss_is_finite():
     loss, items = E2ELoss(model, hyp={"epochs": 1})(preds, batch)
     assert bool(tf.reduce_all(tf.math.is_finite(loss)))
     assert bool(tf.reduce_all(tf.math.is_finite(items)))
+
+
+def test_e2e_loss_matches_yolo26_branch_schedule():
+    model = build_model("yolo26n.yaml", nc=1, imgsz=64)
+    loss_fn = E2ELoss(model, hyp={"epochs": 5})
+    assert loss_fn.one2many.assigner.topk == 10
+    assert loss_fn.one2one.assigner.topk == 7
+    assert loss_fn.one2one.assigner.topk2 == 1
+    assert loss_fn.o2m == 0.8
+    assert loss_fn.o2o == pytest.approx(0.2)
+    loss_fn.update()
+    assert loss_fn.o2m == pytest.approx(0.625)
+    assert loss_fn.o2o == pytest.approx(0.375)
+    for _ in range(10):
+        loss_fn.update()
+    assert loss_fn.o2m == pytest.approx(0.1)
+    assert loss_fn.o2o == pytest.approx(0.9)

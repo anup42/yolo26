@@ -232,12 +232,20 @@ class YOLO26Trainer:
             for i, batch_data in enumerate(iterator):
                 ni = epoch * len(train_ds) + i
                 lr = self._set_lr_momentum(ni, nw)
-                if self.replicas > 1:
-                    per_replica = self.strategy.run(self._train_step, args=(batch_data, accumulate, lr))
-                    loss_items = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica, axis=None)
-                else:
-                    batch_tf = to_tensor_batch(batch_data)
-                    loss_items = self._train_step(batch_tf, accumulate, lr)
+                current_accumulate = accumulate
+                if nw and ni <= nw:
+                    current_accumulate = max(1, int(round(np.interp(ni, [0, nw], [1, accumulate]).item())))
+                try:
+                    if self.replicas > 1:
+                        per_replica = self.strategy.run(self._train_step, args=(batch_data, current_accumulate, lr))
+                        loss_items = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica, axis=None)
+                    else:
+                        batch_tf = to_tensor_batch(batch_data)
+                        loss_items = self._train_step(batch_tf, current_accumulate, lr)
+                except FloatingPointError:
+                    if self._recover_from_nan(epoch):
+                        continue
+                    raise
                 losses.append(np.asarray(loss_items.numpy(), dtype=np.float32))
                 if i == 0 or (self.cfg.log_interval > 0 and (i + 1) % self.cfg.log_interval == 0) or (i + 1) == len(train_ds):
                     li = losses[-1]
@@ -316,6 +324,7 @@ class YOLO26Trainer:
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
         for g in self.accum_grads:
             g.assign(tf.zeros_like(g))
+        self.accum_counter = 0
         if self.ema:
             self.ema.update(self.model)
 
@@ -399,6 +408,23 @@ class YOLO26Trainer:
     def _load_resume_training_state(self):
         self._load_optimizer_state()
         self._load_ema_state()
+
+    def _recover_from_nan(self, epoch: int) -> bool:
+        """Restore the last checkpoint after non-finite loss, matching Ultralytics recovery intent."""
+        print(f"warning: non-finite loss at epoch {epoch + 1}; restoring last checkpoint", flush=True)
+        if not self.last.exists():
+            return False
+        try:
+            self.model.load_weights(str(self.last))
+            if self.accum_grads:
+                for g in self.accum_grads:
+                    g.assign(tf.zeros_like(g))
+            self.accum_counter = 0
+            if self.ema:
+                self.ema = ModelEMA(self.model)
+            return True
+        except Exception:
+            return False
 
     def _build_optimizer_slots(self):
         opt = inner_optimizer(self.optimizer)
@@ -592,8 +618,7 @@ def apply_decoupled_weight_decay(variables, lr: float, weight_decay: float):
     if not weight_decay:
         return
     for v in variables:
-        name = getattr(v, "name", "")
-        if len(v.shape) <= 1 or "bias" in name or "batch_normalization" in name or "bn" in name:
+        if variable_decay_group(v) != "decay":
             continue
         v.assign_sub(tf.cast(lr * weight_decay, v.dtype) * v)
 
@@ -601,3 +626,13 @@ def apply_decoupled_weight_decay(variables, lr: float, weight_decay: float):
 def is_bias_variable(var) -> bool:
     name = str(getattr(var, "path", None) or getattr(var, "name", "")).lower()
     return name.endswith("bias") or "/bias" in name or ".bias" in name
+
+
+def variable_decay_group(var) -> str:
+    """Classify variables into Ultralytics-style decay/no-decay/bias groups."""
+    name = str(getattr(var, "path", None) or getattr(var, "name", "")).lower()
+    if is_bias_variable(var):
+        return "bias"
+    if len(var.shape) <= 1 or any(token in name for token in ("batch_normalization", "batchnorm", "/bn", ".bn", "layer_norm", "group_norm")):
+        return "norm"
+    return "decay"

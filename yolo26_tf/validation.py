@@ -11,7 +11,7 @@ import numpy as np
 
 from .coco import COCO80_TO_COCO91, coco_image_id_from_path, evaluate_coco_predictions
 from .data import YOLODataset, load_data_yaml
-from .metrics import ConfusionMatrix, ap_per_class, targets_from_batch
+from .metrics import ConfusionMatrix, DetMetrics, targets_from_batch
 from .ops import nms_numpy, scale_boxes_np
 from .tf_import import require_tf
 
@@ -33,6 +33,7 @@ def validate_detection_model(
     save_conf: bool = False,
     single_cls: bool = False,
     agnostic_nms: bool = False,
+    multi_label: bool = False,
     half: bool = False,
     project: str | Path = "runs/detect",
     name: str = "val",
@@ -47,6 +48,7 @@ def validate_detection_model(
     if save_txt:
         label_dir.mkdir(parents=True, exist_ok=True)
     preds_all, targets_all, coco_rows, image_ids = [], [], [], []
+    det_metrics = DetMetrics(names=data_dict.get("names", {}))
     confusion = ConfusionMatrix(data_dict["nc"], conf=conf, iou_thres=iou)
     seen = 0
     t_infer = 0.0
@@ -62,7 +64,7 @@ def validate_detection_model(
         if single_cls:
             batch_targets = [(np.zeros_like(cls), boxes) for cls, boxes in batch_targets]
         for si, (pred, im_file, shape, ratio, pad) in enumerate(zip(raw, b["im_file"], b["ori_shape"], b["ratio"], b["pad"])):
-            det = prediction_to_detections(pred, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms)
+            det = prediction_to_detections(pred, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic_nms, multi_label=multi_label)
             if single_cls and len(det):
                 det[:, 5] = 0
             preds_all.append(det.astype(np.float32))
@@ -87,7 +89,8 @@ def validate_detection_model(
             (out_dir / "predictions.json").write_text(json.dumps(coco_rows), encoding="utf-8")
         metrics = evaluate_coco_predictions(ann, coco_rows, image_ids=image_ids)
     else:
-        metrics = ap_per_class(preds_all, targets_all)
+        det_metrics.update_stats(preds_all, targets_all)
+        metrics = det_metrics.process()
     metrics = {
         **metrics,
         "images": int(seen),
@@ -101,7 +104,14 @@ def validate_detection_model(
     return metrics
 
 
-def prediction_to_detections(pred: np.ndarray, conf: float = 0.25, iou: float = 0.45, max_det: int = 300, agnostic: bool = False) -> np.ndarray:
+def prediction_to_detections(
+    pred: np.ndarray,
+    conf: float = 0.25,
+    iou: float = 0.45,
+    max_det: int = 300,
+    agnostic: bool = False,
+    multi_label: bool = False,
+) -> np.ndarray:
     if pred.size == 0:
         return np.zeros((0, 6), dtype=np.float32)
     if pred.shape[-1] == 6:
@@ -110,9 +120,52 @@ def prediction_to_detections(pred: np.ndarray, conf: float = 0.25, iou: float = 
             det = det[np.argsort(-det[:, 4])[:max_det]]
         return det.astype(np.float32)
     boxes, scores = pred[:, :4], pred[:, 4:]
-    cls = scores.argmax(axis=-1)
-    score = scores.max(axis=-1)
-    return nms_numpy(np.concatenate([boxes, score[:, None], cls[:, None]], axis=-1), conf=conf, iou=iou, max_det=max_det, agnostic=agnostic)
+    if multi_label:
+        rows, cols = np.nonzero(scores > conf)
+        if len(rows):
+            det = np.concatenate([boxes[rows], scores[rows, cols, None], cols[:, None].astype(np.float32)], axis=-1)
+        else:
+            det = np.zeros((0, 6), dtype=np.float32)
+    else:
+        cls = scores.argmax(axis=-1)
+        score = scores.max(axis=-1)
+        det = np.concatenate([boxes, score[:, None], cls[:, None]], axis=-1)
+    return nms_numpy(det, conf=conf, iou=iou, max_det=max_det, agnostic=agnostic)
+
+
+class DetectionValidator:
+    """Ultralytics-style validator wrapper around the TensorFlow validation path."""
+
+    def __init__(self, model=None, data: str | Path | dict | None = None, **kwargs):
+        self.model = model
+        self.data = data
+        self.args = kwargs
+        self.metrics: DetMetrics | None = None
+        self.results_dict: dict[str, Any] = {}
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
+
+    def preprocess(self, batch: dict) -> dict:
+        return batch
+
+    def postprocess(self, preds: np.ndarray) -> list[np.ndarray]:
+        return [prediction_to_detections(p, **{k: self.args[k] for k in ("conf", "iou", "max_det") if k in self.args}) for p in preds]
+
+    def __call__(self, model=None, data=None, **kwargs) -> dict[str, Any]:
+        model = model or self.model
+        data = data or self.data
+        if model is None or data is None:
+            raise ValueError("DetectionValidator requires both model and data.")
+        args = {**self.args, **kwargs}
+        self.results_dict = validate_detection_model(model, data, **args)
+        self.metrics = DetMetrics(names=load_data_yaml(data).get("names", {}))
+        self.metrics.results_dict = self.results_dict
+        self.speed = {
+            "preprocess": float(self.results_dict.get("speed/preprocess_ms_per_image", 0.0)),
+            "inference": float(self.results_dict.get("speed/inference_ms_per_image", 0.0)),
+            "loss": 0.0,
+            "postprocess": float(self.results_dict.get("speed/postprocess_ms_per_image", 0.0)),
+        }
+        return self.results_dict
 
 
 def detections_to_coco_rows(det: np.ndarray, image_id: int, ori_shape, input_shape, ratio, pad) -> list[dict]:

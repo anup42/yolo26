@@ -87,6 +87,7 @@ def main(argv=None):
     val.add_argument("--save-conf", action="store_true")
     val.add_argument("--single-cls", action="store_true")
     val.add_argument("--agnostic-nms", action="store_true")
+    val.add_argument("--multi-label", action="store_true")
     val.add_argument("--half", action="store_true")
     val.add_argument("--project", default="runs/detect")
     val.add_argument("--name", default="val")
@@ -113,7 +114,10 @@ def main(argv=None):
     exp.add_argument("--full-integer", action="store_true")
     exp.add_argument("--dynamic", dest="dynamic", action="store_true", default=True)
     exp.add_argument("--static", dest="dynamic", action="store_false")
-    exp.add_argument("--nms", action="store_true", help="Request NMS-embedded export; currently fails with a clear unsupported-option error.")
+    exp.add_argument("--nms", action="store_true", help="Embed TensorFlow NMS in SavedModel/PB/TFLite exports.")
+    exp.add_argument("--conf", type=float, default=0.25)
+    exp.add_argument("--iou", type=float, default=0.45)
+    exp.add_argument("--max-det", type=int, default=300)
     exp.add_argument("--no-verify", dest="verify", action="store_false", default=True)
 
     bench = detect_sub.add_parser("benchmark-coco")
@@ -204,6 +208,7 @@ def main(argv=None):
             save_conf=args.save_conf,
             single_cls=args.single_cls,
             agnostic_nms=args.agnostic_nms,
+            multi_label=args.multi_label,
             half=args.half,
             project=args.project,
             name=args.name,
@@ -235,6 +240,9 @@ def main(argv=None):
                 full_integer=args.full_integer,
                 dynamic=args.dynamic,
                 nms=args.nms,
+                conf=args.conf,
+                iou=args.iou,
+                max_det=args.max_det,
                 verify=args.verify,
             )
         )

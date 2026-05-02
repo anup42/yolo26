@@ -13,7 +13,8 @@ from pathlib import Path
 import numpy as np
 
 from yolo26_tf.converter import convert_pt_to_tf, parity_check
-from yolo26_tf.losses import BboxLoss, TaskAlignedAssigner
+from yolo26_tf.losses import BboxLoss, E2ELoss, TaskAlignedAssigner
+from yolo26_tf.model import build_model
 
 
 def check_forward(weights: Path, imgsz: int, nc: int) -> dict:
@@ -103,6 +104,26 @@ def check_bbox_loss() -> dict:
     }
 
 
+def check_e2e_loss_schedule(imgsz: int, nc: int) -> dict:
+    model = build_model("yolo26n.yaml", nc=nc, imgsz=imgsz)
+    loss = E2ELoss(model, hyp={"epochs": 5})
+    before = {"o2m": float(loss.o2m), "o2o": float(loss.o2o)}
+    loss.update()
+    after_one = {"o2m": float(loss.o2m), "o2o": float(loss.o2o)}
+    for _ in range(10):
+        loss.update()
+    after_final = {"o2m": float(loss.o2m), "o2o": float(loss.o2o)}
+    return {
+        "check": "e2e_loss_schedule",
+        "one2many_topk": loss.one2many.assigner.topk,
+        "one2one_topk": loss.one2one.assigner.topk,
+        "one2one_topk2": loss.one2one.assigner.topk2,
+        "weights_initial": before,
+        "weights_after_one_update": after_one,
+        "weights_after_decay": after_final,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run PyTorch-vs-TensorFlow YOLO26 parity checks.")
     parser.add_argument("--weights", default="yolo26n.pt")
@@ -111,15 +132,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forward", action="store_true")
     parser.add_argument("--assigner", action="store_true")
     parser.add_argument("--bbox-loss", action="store_true")
+    parser.add_argument("--e2e-loss", action="store_true")
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    run_forward = args.forward or not (args.forward or args.assigner or args.bbox_loss)
-    run_assigner = args.assigner or not (args.forward or args.assigner or args.bbox_loss)
-    run_bbox_loss = args.bbox_loss or not (args.forward or args.assigner or args.bbox_loss)
+    selected = args.forward or args.assigner or args.bbox_loss or args.e2e_loss
+    run_forward = args.forward or not selected
+    run_assigner = args.assigner or not selected
+    run_bbox_loss = args.bbox_loss or not selected
+    run_e2e_loss = args.e2e_loss or not selected
     results = []
     if run_forward:
         results.append(check_forward(Path(args.weights), args.imgsz, args.nc))
@@ -127,6 +151,8 @@ def main() -> int:
         results.append(check_assigner())
     if run_bbox_loss:
         results.append(check_bbox_loss())
+    if run_e2e_loss:
+        results.append(check_e2e_loss_schedule(args.imgsz, args.nc))
     text = json.dumps({"results": results}, indent=2)
     print(text)
     if args.output:
