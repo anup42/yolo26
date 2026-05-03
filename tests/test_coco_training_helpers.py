@@ -140,12 +140,16 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert 'FAST_DATA="${YOLO26_COCO_FAST_DATA:-0}"' in script
     assert 'PREFETCH_DATA="${YOLO26_COCO_PREFETCH_DATA:-1}"' in script
     assert 'OPTIMIZER="${YOLO26_COCO_OPTIMIZER:-sgd}"' in script
+    assert 'EMA_UPDATE_INTERVAL="${YOLO26_COCO_EMA_UPDATE_INTERVAL:-10}"' in script
     assert 'PROFILE_STAGE="${YOLO26_COCO_PROFILE_STAGE:-0}"' in script
     assert 'PROFILE_BATCHES="${YOLO26_COCO_PROFILE_BATCHES:-0}"' in script
     assert 'SYNC_PROFILE_STAGE="${YOLO26_COCO_SYNC_PROFILE_STAGE:-0}"' in script
     assert 'GPU_MONITOR="${YOLO26_COCO_GPU_MONITOR:-0}"' in script
     assert "nvidia-smi --query-gpu" in script
     assert "trap cleanup EXIT" in script
+    assert "stale yolo26_tf package detected" in script
+    assert "YOLO26 speed defaults:" in script
+    assert "Repository commit:" in script
     assert "CUDA_LAUNCH_BLOCKING=1" in script
     assert '[[ "$AMP" == "1" ]] && echo "--amp" || echo "--no-amp"' in script
     assert "bash scripts/train_coco_yolo26n_linux.sh" in readme
@@ -154,8 +158,11 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert "YOLO26_COCO_FAST_DATA=0" in readme
     assert "YOLO26_COCO_PREFETCH_DATA=1" in readme
     assert "YOLO26_COCO_OPTIMIZER=sgd" in readme
+    assert "YOLO26_COCO_EMA_UPDATE_INTERVAL=10" in readme
     assert "YOLO26_COCO_COMPILE=0" in readme
     assert "YOLO26_COCO_PROFILE_BATCHES=200" in readme
+    assert "YOLO26 package version: 0.1.1" in readme
+    assert "data_path=tf_data_prefetch" in readme
     assert "stage_profile.csv" in readme
     assert "gpu_stats.csv" in readme
 

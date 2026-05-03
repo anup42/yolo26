@@ -85,7 +85,8 @@ The training runner now defaults to the stability path:
 
 - stable eager TensorFlow gradient step by default: `YOLO26_COCO_COMPILE=0`;
 - stable FP32 training by default: `YOLO26_COCO_AMP=0`;
-- built-in SGD optimizer by default for throughput diagnostics: `YOLO26_COCO_OPTIMIZER=sgd`;
+- custom non-XLA SGD optimizer by default to avoid Keras optimizer retracing: `YOLO26_COCO_OPTIMIZER=sgd`;
+- reduced EMA overhead in the Linux runner: `YOLO26_COCO_EMA_UPDATE_INTERVAL=10`;
 - safe serial `tf.data` prefetch by default: `YOLO26_COCO_PREFETCH_DATA=1`;
 - parallel fast-data path remains opt-in: `YOLO26_COCO_FAST_DATA=0`;
 - TFRecord generation and training input when available: `YOLO26_COCO_USE_TFRECORD=1`;
@@ -107,7 +108,18 @@ Training logs are streamed to:
 runs/train/yolo26n_tf_coco/train_coco_yolo26n.log
 ```
 
-`YOLO26_COCO_BATCH=16`, `YOLO26_COCO_AMP=0`, `YOLO26_COCO_FAST_DATA=0`, `YOLO26_COCO_PREFETCH_DATA=1`, and `YOLO26_COCO_OPTIMIZER=sgd` are the stable starting point for an RTX A6000 48 GB run. After a stable epoch completes, tune in this order: try batch `32`, then `YOLO26_COCO_FAST_DATA=1`, then batch `48`, then `YOLO26_COCO_AMP=1`. Keep `YOLO26_COCO_COMPILE=0` for stable training; `YOLO26_COCO_COMPILE=1` is an experimental speed path that can trigger unrecoverable TensorFlow GPU CUDA faults on some systems. Use `YOLO26_COCO_OPTIMIZER=auto` only for MuSGD parity runs after throughput is understood. If the GPU still crashes, run one diagnostic pass with `YOLO26_COCO_CUDA_SYNC=1 bash scripts/train_coco_yolo26n_linux.sh`. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
+The startup log must show the new code path before training starts:
+
+```text
+YOLO26 package version: 0.1.1
+YOLO26 speed defaults: prefetch_data=True fast_data=False compile_train_step=False
+training runtime: ... prefetch_data=True ...
+training data: data_path=tf_data_prefetch ...
+```
+
+If the log still shows `data_path=python_iterator` with no `prefetch_data=...` field, the Linux machine is running an old checkout/package. Run `git pull` in the repo and rerun `bash scripts/train_coco_yolo26n_linux.sh`; the script now fails early if the installed package is stale.
+
+`YOLO26_COCO_BATCH=16`, `YOLO26_COCO_AMP=0`, `YOLO26_COCO_FAST_DATA=0`, `YOLO26_COCO_PREFETCH_DATA=1`, `YOLO26_COCO_OPTIMIZER=sgd`, and `YOLO26_COCO_EMA_UPDATE_INTERVAL=10` are the stable starting point for an RTX A6000 48 GB run. After a stable epoch completes, tune in this order: try batch `32`, then `YOLO26_COCO_FAST_DATA=1`, then batch `48`, then `YOLO26_COCO_AMP=1`. Keep `YOLO26_COCO_COMPILE=0` for stable training; `YOLO26_COCO_COMPILE=1` is an experimental speed path that can trigger unrecoverable TensorFlow GPU CUDA faults on some systems. Use `YOLO26_COCO_OPTIMIZER=auto` only for MuSGD parity runs after throughput is understood, and `YOLO26_COCO_OPTIMIZER=tfsgd` only if you specifically want Keras SGD for comparison. If the GPU still crashes, run one diagnostic pass with `YOLO26_COCO_CUDA_SYNC=1 bash scripts/train_coco_yolo26n_linux.sh`. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
 
 To identify epoch-time bottlenecks without running a full epoch:
 

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from yolo26_tf.losses import TaskAlignedAssigner
-from yolo26_tf.optim import make_optimizer
+from yolo26_tf.optim import FastSGD, make_optimizer
 from yolo26_tf.trainer import resolve_optimizer_auto, variable_decay_group
 
 
@@ -16,6 +16,17 @@ def test_musgd_defaults_match_ultralytics_coefficients():
     opt = make_optimizer("musgd", lr=0.01, momentum=0.9, weight_decay=0.0, iterations=10001)
     assert opt.muon == 0.2
     assert opt.sgd == 1.0
+
+
+def test_sgd_default_uses_non_xla_fast_sgd():
+    tf = pytest.importorskip("tensorflow")
+    opt = make_optimizer("sgd", lr=0.1, momentum=0.0, weight_decay=0.0, iterations=100)
+    assert isinstance(opt, FastSGD)
+    var = tf.Variable([1.0], dtype=tf.float32)
+    opt.apply_gradients([(tf.constant([0.5], dtype=tf.float32), var)])
+    np.testing.assert_allclose(var.numpy(), [0.95], atol=1e-6)
+    keras_opt = make_optimizer("tfsgd", lr=0.1, momentum=0.0, weight_decay=0.0, iterations=100)
+    assert isinstance(keras_opt, tf.keras.optimizers.Optimizer)
 
 
 def test_variable_decay_group_matches_bias_norm_decay_split():

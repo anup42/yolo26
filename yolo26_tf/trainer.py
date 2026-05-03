@@ -996,21 +996,25 @@ def inner_optimizer(optimizer):
 
 def set_optimizer_attr(optimizer, name: str, value: float):
     opt = inner_optimizer(optimizer)
+    assigned = False
     if hasattr(opt, name):
         attr = getattr(opt, name)
         try:
             attr.assign(value)
+            assigned = True
         except Exception:
             try:
                 setattr(opt, name, value)
+                assigned = True
             except Exception:
                 pass
-    if name == "learning_rate" and hasattr(opt, "learning_rate"):
+    if name == "learning_rate" and hasattr(opt, "learning_rate") and not assigned:
         try:
             opt.learning_rate = value
+            assigned = True
         except Exception:
             pass
-    if hasattr(opt, "learning_rate") and hasattr(opt.learning_rate, "assign") and name == "learning_rate":
+    if hasattr(opt, "learning_rate") and hasattr(opt.learning_rate, "assign") and name == "learning_rate" and not assigned:
         opt.learning_rate.assign(value)
 
 

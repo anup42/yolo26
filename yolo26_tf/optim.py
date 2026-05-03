@@ -101,6 +101,55 @@ class MuSGD:
                 var.assign_sub(lr * update)
 
 
+class FastSGD:
+    """Non-XLA eager SGD used as the stable high-throughput default."""
+
+    def __init__(self, learning_rate=0.01, momentum=0.9, weight_decay=0.0, nesterov=True):
+        self.learning_rate = tf.Variable(float(learning_rate), trainable=False, dtype=tf.float32)
+        self.momentum = tf.Variable(float(momentum), trainable=False, dtype=tf.float32)
+        self.weight_decay = float(weight_decay)
+        self.nesterov = bool(nesterov)
+        self.state = {}
+        self._pending_state = {}
+
+    def _state(self, var):
+        key = (_var_key(var), "momentum")
+        if key not in self.state:
+            self.state[key] = tf.Variable(tf.zeros_like(var), trainable=False)
+            pending = self._pending_state.pop("|".join(key), None)
+            if pending is not None:
+                self.state[key].assign(pending)
+        return self.state[key]
+
+    def state_dict(self):
+        return {"|".join(k): v.numpy() for k, v in self.state.items()}
+
+    def load_state_dict(self, state):
+        self._pending_state = dict(state)
+        for key, value in state.items():
+            parts = str(key).rsplit("|", 1)
+            if len(parts) != 2:
+                continue
+            state_key = (parts[0], parts[1])
+            if state_key in self.state:
+                self.state[state_key].assign(value)
+                self._pending_state.pop(key, None)
+
+    def apply_gradients(self, grads_and_vars):
+        lr = tf.cast(self.learning_rate, tf.float32)
+        momentum = tf.cast(self.momentum, tf.float32)
+        for grad, var in grads_and_vars:
+            if grad is None:
+                continue
+            grad = tf.cast(grad, var.dtype)
+            if self.weight_decay:
+                grad = grad + tf.cast(self.weight_decay, var.dtype) * var
+            buf = self._state(var)
+            buf.assign(buf * tf.cast(momentum, var.dtype) + grad)
+            update = grad + tf.cast(momentum, var.dtype) * buf if self.nesterov else buf
+            var.assign_sub(tf.cast(lr, var.dtype) * update)
+
+
 def make_optimizer(name="auto", lr=0.01, momentum=0.9, weight_decay=5e-4, iterations=1000):
     name = (name or "auto").lower()
     if name == "auto":
@@ -108,7 +157,9 @@ def make_optimizer(name="auto", lr=0.01, momentum=0.9, weight_decay=5e-4, iterat
     if name == "musgd":
         return MuSGD(lr, momentum, weight_decay, nesterov=True, muon=0.2, sgd=1.0)
     if name == "sgd":
-        return tf.keras.optimizers.SGD(learning_rate=lr, momentum=momentum, nesterov=True, weight_decay=weight_decay)
+        return FastSGD(lr, momentum, weight_decay=0.0, nesterov=True)
+    if name in {"tfsgd", "keras_sgd"}:
+        return tf.keras.optimizers.SGD(learning_rate=lr, momentum=momentum, nesterov=True, weight_decay=0.0)
     if name == "adamw":
         return tf.keras.optimizers.AdamW(learning_rate=lr, weight_decay=weight_decay, beta_1=momentum)
     if name == "adam":

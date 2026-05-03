@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 PINNED_ULTRALYTICS_COMMIT = "b4cf7c4751e1d532eb5b0f5a3e9d67b9583964a7"
 
 

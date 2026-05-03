@@ -47,6 +47,7 @@ SYNC_PROFILE_STAGE="${YOLO26_COCO_SYNC_PROFILE_STAGE:-0}"
 GPU_MONITOR="${YOLO26_COCO_GPU_MONITOR:-0}"
 GPU_MONITOR_INTERVAL="${YOLO26_COCO_GPU_MONITOR_INTERVAL:-5}"
 OPTIMIZER="${YOLO26_COCO_OPTIMIZER:-sgd}"
+EMA_UPDATE_INTERVAL="${YOLO26_COCO_EMA_UPDATE_INTERVAL:-10}"
 
 mkdir -p "$OUT_DIR"
 LOG_FILE="${YOLO26_COCO_LOG:-$OUT_DIR/train_coco_yolo26n.log}"
@@ -154,6 +155,47 @@ python -m pip install "$NUMPY_PACKAGE" "$TENSORFLOW_PACKAGE"
 python -m pip install -e "$ROOT_DIR[convert,dev]" "pycocotools>=2.0.7" "tqdm>=4.66" "$NUMPY_PACKAGE"
 python -m pip install --force-reinstall "$NUMPY_PACKAGE"
 python -m pip check
+
+echo "Repository root: $ROOT_DIR"
+if command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Repository commit: $(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+fi
+
+python - "$ROOT_DIR" <<'PY'
+import importlib.metadata as metadata
+import inspect
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+import yolo26_tf
+from yolo26_tf.trainer import TrainConfig
+
+pkg_path = Path(inspect.getfile(yolo26_tf)).resolve()
+cfg = TrainConfig()
+required = {
+    "prefetch_data": True,
+    "sync_profile_stage": False,
+    "ema_update_interval": 1,
+}
+missing = [name for name in required if not hasattr(cfg, name)]
+wrong = [f"{name}={getattr(cfg, name)!r}" for name, expected in required.items() if hasattr(cfg, name) and getattr(cfg, name) != expected]
+print("YOLO26 package:", pkg_path)
+print("YOLO26 package version:", getattr(yolo26_tf, "__version__", "unknown"), "metadata:", metadata.version("yolo26-tf"))
+print(
+    "YOLO26 speed defaults:",
+    f"prefetch_data={getattr(cfg, 'prefetch_data', None)}",
+    f"fast_data={cfg.fast_data}",
+    f"compile_train_step={cfg.compile_train_step}",
+    f"amp={cfg.amp}",
+)
+try:
+    pkg_path.relative_to(root)
+except ValueError as exc:
+    raise SystemExit(f"yolo26_tf is not imported from this checkout: package={pkg_path}, root={root}") from exc
+if missing or wrong:
+    raise SystemExit(f"stale yolo26_tf package detected: missing={missing}, wrong={wrong}. Run git pull and rerun this script.")
+PY
 
 python - <<'PY'
 from importlib.metadata import version
@@ -263,6 +305,7 @@ python -m yolo26_tf.cli detect train \
   $([[ "$PROFILE_SPEED" == "1" ]] && echo "--profile-speed" || echo "--no-profile-speed") \
   $([[ "$PROFILE_STAGE" == "1" ]] && echo "--profile-stage" || echo "") \
   $([[ "$SYNC_PROFILE_STAGE" == "1" ]] && echo "--sync-profile-stage" || echo "") \
+  --ema-update-interval "$EMA_UPDATE_INTERVAL" \
   --profile-batches "$PROFILE_BATCHES"
 
 cleanup
