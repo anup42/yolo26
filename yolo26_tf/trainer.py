@@ -82,6 +82,7 @@ class TrainConfig:
     profile_batches: int = 0
     sync_profile_stage: bool = False
     ema_update_interval: int = 1
+    graph_forward: bool = True
     graph_optimizer_apply: bool = True
 
 
@@ -146,6 +147,7 @@ class YOLO26Trainer:
         self.accum_grads = None
         self.accum_counter = 0
         self._compiled_train_step_failed = False
+        self._graph_forward_failed = False
         self.total_iterations = 1
         self.bias_lr = self.cfg.lr0
         self.train_time_start = 0.0
@@ -216,6 +218,7 @@ class YOLO26Trainer:
             f"profile_speed={self.cfg.profile_speed}, profile_stage={self.cfg.profile_stage}, "
             f"profile_batches={self.cfg.profile_batches}, sync_profile_stage={self.cfg.sync_profile_stage}, "
             f"ema_update_interval={self.cfg.ema_update_interval}, "
+            f"graph_forward={self.cfg.graph_forward}, "
             f"graph_optimizer_apply={self.cfg.graph_optimizer_apply}, "
             f"gpu_memory_growth={gpu_memory_growth_status()}",
             flush=True,
@@ -386,6 +389,7 @@ class YOLO26Trainer:
                             "optimizer": self.optimizer_name,
                             "data_path": self.data_path,
                             "sample_workers": float(train_ds.sample_workers),
+                            "graph_forward": float(bool(self.cfg.graph_forward and not self._graph_forward_failed)),
                             **train_ds.image_cache_stats(),
                         }
                     )
@@ -505,7 +509,7 @@ class YOLO26Trainer:
 
         with tf.GradientTape() as tape:
             t = time.perf_counter()
-            preds = self.model(batch_tf["img"], training=True)
+            preds = self._forward_train(batch_tf["img"])
             self._sync_profile_value(preds)
             stage["forward_ms"] = (time.perf_counter() - t) * 1000.0
 
@@ -541,6 +545,19 @@ class YOLO26Trainer:
         if self.cfg.sync_profile_stage:
             sync_tensors(value)
 
+    def _forward_train(self, images):
+        if self.cfg.graph_forward and not self._graph_forward_failed:
+            try:
+                return self._graph_forward_train(images)
+            except Exception as exc:
+                self._graph_forward_failed = True
+                print(f"graph forward disabled after failure: {exc}", flush=True)
+        return self.model(images, training=True)
+
+    @tf.function(input_signature=[tf.TensorSpec(shape=(None, None, None, 3), dtype=tf.float32)], reduce_retracing=True, jit_compile=False)
+    def _graph_forward_train(self, images):
+        return self.model(images, training=True)
+
     @tf.function(reduce_retracing=True)
     def _compiled_grad_step(self, batch_tf: dict, accumulate_f):
         batch_tf = to_tensor_batch(batch_tf)
@@ -562,7 +579,7 @@ class YOLO26Trainer:
         if self.cfg.multi_scale > 0.0:
             batch_tf = multiscale_batch(batch_tf, self.cfg.imgsz, factor=self.cfg.multi_scale)
         with tf.GradientTape() as tape:
-            preds = self.model(batch_tf["img"], training=True)
+            preds = self._forward_train(batch_tf["img"])
             loss, loss_items = self.loss_fn(preds, batch_tf)
             loss = tf.cast(loss, tf.float32) / float(accumulate)
             scaled_loss = scale_loss(self.optimizer, loss)
@@ -884,6 +901,7 @@ class YOLO26Trainer:
             "stage profile context: "
             f"optimizer={last.get('optimizer', self.optimizer_name)}, data_path={last.get('data_path', self.data_path)}, "
             f"sample_workers={int(float(last.get('sample_workers', 0)))}, "
+            f"graph_forward={bool(float(last.get('graph_forward', 0)))}, "
             f"image_cache_hits={int(float(last.get('image_cache_hits', 0)))}, "
             f"image_cache_misses={int(float(last.get('image_cache_misses', 0)))}, "
             f"image_cache_items={int(float(last.get('image_cache_items', 0)))}, "
@@ -969,6 +987,7 @@ def stage_profile_fields() -> list[str]:
         "optimizer",
         "data_path",
         "sample_workers",
+        "graph_forward",
         "image_cache_hits",
         "image_cache_misses",
         "image_cache_items",

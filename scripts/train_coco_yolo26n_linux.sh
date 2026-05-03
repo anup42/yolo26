@@ -48,6 +48,7 @@ GPU_MONITOR="${YOLO26_COCO_GPU_MONITOR:-0}"
 GPU_MONITOR_INTERVAL="${YOLO26_COCO_GPU_MONITOR_INTERVAL:-5}"
 OPTIMIZER="${YOLO26_COCO_OPTIMIZER:-sgd}"
 EMA_UPDATE_INTERVAL="${YOLO26_COCO_EMA_UPDATE_INTERVAL:-10}"
+GRAPH_FORWARD="${YOLO26_COCO_GRAPH_FORWARD:-1}"
 GRAPH_OPTIMIZER_APPLY="${YOLO26_COCO_GRAPH_OPTIMIZER_APPLY:-1}"
 SAMPLE_WORKERS="${YOLO26_COCO_SAMPLE_WORKERS:-8}"
 
@@ -179,6 +180,7 @@ required = {
     "prefetch_data": True,
     "sync_profile_stage": False,
     "ema_update_interval": 1,
+    "graph_forward": True,
     "graph_optimizer_apply": True,
     "sample_workers": 0,
 }
@@ -192,6 +194,7 @@ print(
     f"fast_data={cfg.fast_data}",
     f"compile_train_step={cfg.compile_train_step}",
     f"amp={cfg.amp}",
+    f"graph_forward={cfg.graph_forward}",
     f"graph_optimizer_apply={cfg.graph_optimizer_apply}",
     f"sample_workers={cfg.sample_workers}",
 )
@@ -313,6 +316,7 @@ python -m yolo26_tf.cli detect train \
   $([[ "$PROFILE_STAGE" == "1" ]] && echo "--profile-stage" || echo "") \
   $([[ "$SYNC_PROFILE_STAGE" == "1" ]] && echo "--sync-profile-stage" || echo "") \
   --ema-update-interval "$EMA_UPDATE_INTERVAL" \
+  $([[ "$GRAPH_FORWARD" == "1" ]] && echo "--graph-forward" || echo "--no-graph-forward") \
   $([[ "$GRAPH_OPTIMIZER_APPLY" == "1" ]] && echo "--graph-optimizer-apply" || echo "--no-graph-optimizer-apply") \
   --profile-batches "$PROFILE_BATCHES"
 

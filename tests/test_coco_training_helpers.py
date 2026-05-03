@@ -88,6 +88,7 @@ def test_train_config_exposes_coco_parity_knobs():
     assert TrainConfig().prefetch_data is True
     assert TrainConfig().sample_workers == 0
     assert TrainConfig().ema_update_interval == 1
+    assert TrainConfig().graph_forward is True
     assert TrainConfig().graph_optimizer_apply is True
     cfg = TrainConfig(
         amp=True,
@@ -105,6 +106,7 @@ def test_train_config_exposes_coco_parity_knobs():
         fast_nms=True,
         cache_images="auto",
         ema_update_interval=2,
+        graph_forward=False,
         graph_optimizer_apply=False,
     )
     assert cfg.amp is True
@@ -122,6 +124,7 @@ def test_train_config_exposes_coco_parity_knobs():
     assert cfg.fast_nms is True
     assert cfg.cache_images == "auto"
     assert cfg.ema_update_interval == 2
+    assert cfg.graph_forward is False
     assert cfg.graph_optimizer_apply is False
 
 
@@ -137,11 +140,13 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert args.profile_stage is False
     assert args.profile_batches == 0
     assert args.ema_update_interval == 1
+    assert args.graph_forward is True
     assert args.graph_optimizer_apply is True
     assert parser.parse_args(["--data", "data.yaml", "--compile"]).compile_train_step is True
     assert parser.parse_args(["--data", "data.yaml", "--fast-data"]).fast_data is True
     assert parser.parse_args(["--data", "data.yaml", "--no-prefetch-data"]).prefetch_data is False
     assert parser.parse_args(["--data", "data.yaml", "--sample-workers", "4"]).sample_workers == 4
+    assert parser.parse_args(["--data", "data.yaml", "--no-graph-forward"]).graph_forward is False
     assert parser.parse_args(["--data", "data.yaml", "--no-graph-optimizer-apply"]).graph_optimizer_apply is False
     assert parser.parse_args(["--data", "data.yaml", "--no-amp"]).amp is False
     profile_args = parser.parse_args(["--data", "data.yaml", "--profile-stage", "--profile-batches", "2"])
@@ -160,6 +165,7 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert '--sample-workers "$SAMPLE_WORKERS"' in script
     assert 'OPTIMIZER="${YOLO26_COCO_OPTIMIZER:-sgd}"' in script
     assert 'EMA_UPDATE_INTERVAL="${YOLO26_COCO_EMA_UPDATE_INTERVAL:-10}"' in script
+    assert 'GRAPH_FORWARD="${YOLO26_COCO_GRAPH_FORWARD:-1}"' in script
     assert 'GRAPH_OPTIMIZER_APPLY="${YOLO26_COCO_GRAPH_OPTIMIZER_APPLY:-1}"' in script
     assert 'PROFILE_STAGE="${YOLO26_COCO_PROFILE_STAGE:-0}"' in script
     assert 'PROFILE_BATCHES="${YOLO26_COCO_PROFILE_BATCHES:-0}"' in script
@@ -181,10 +187,12 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert "YOLO26_COCO_SAMPLE_WORKERS=8" in readme
     assert "YOLO26_COCO_OPTIMIZER=sgd" in readme
     assert "YOLO26_COCO_EMA_UPDATE_INTERVAL=10" in readme
+    assert "YOLO26_COCO_GRAPH_FORWARD=1" in readme
     assert "YOLO26_COCO_GRAPH_OPTIMIZER_APPLY=1" in readme
     assert "YOLO26_COCO_COMPILE=0" in readme
     assert "YOLO26_COCO_PROFILE_BATCHES=200" in readme
-    assert "YOLO26 package version: 0.1.4" in readme
+    assert "YOLO26 package version: 0.1.5" in readme
+    assert "graph_forward=True" in readme
     assert "graph_optimizer_apply=True" in readme
     assert "data_path=tf_data_prefetch_threaded" in readme
     assert "stage_profile.csv" in readme
