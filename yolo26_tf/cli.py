@@ -56,6 +56,8 @@ def add_train_args(parser):
     parser.add_argument("--no-compile", dest="compile_train_step", action="store_false")
     parser.add_argument("--fast-data", dest="fast_data", action="store_true", default=False, help="Opt-in fast tf.data input pipeline.")
     parser.add_argument("--no-fast-data", dest="fast_data", action="store_false")
+    parser.add_argument("--prefetch-data", dest="prefetch_data", action="store_true", default=True, help="Use a stable serial tf.data prefetch pipeline.")
+    parser.add_argument("--no-prefetch-data", dest="prefetch_data", action="store_false")
     parser.add_argument("--fast-nms", dest="fast_nms", action="store_true", default=True)
     parser.add_argument("--no-fast-nms", dest="fast_nms", action="store_false")
     parser.add_argument("--profile-speed", dest="profile_speed", action="store_true", default=True)
@@ -63,6 +65,8 @@ def add_train_args(parser):
     parser.add_argument("--profile-interval", type=int, default=0)
     parser.add_argument("--profile-stage", action="store_true")
     parser.add_argument("--profile-batches", type=int, default=0)
+    parser.add_argument("--sync-profile-stage", action="store_true", help="Synchronize TensorFlow tensors after profiled stages for diagnostic timing.")
+    parser.add_argument("--ema-update-interval", type=int, default=1)
     parser.add_argument("--cls-pw", type=float, default=0.0)
     parser.add_argument("--mosaic", type=float, default=1.0)
     parser.add_argument("--mosaic-n", type=int, default=4, choices=(3, 4, 9))
@@ -210,11 +214,14 @@ def main(argv=None):
             log_interval=args.log_interval,
             compile_train_step=args.compile_train_step,
             fast_data=args.fast_data,
+            prefetch_data=args.prefetch_data,
             fast_nms=args.fast_nms,
             profile_speed=args.profile_speed,
             profile_interval=args.profile_interval,
             profile_stage=args.profile_stage,
             profile_batches=args.profile_batches,
+            sync_profile_stage=args.sync_profile_stage,
+            ema_update_interval=args.ema_update_interval,
             cls_pw=args.cls_pw,
             mosaic=args.mosaic,
             mosaic_n=args.mosaic_n,

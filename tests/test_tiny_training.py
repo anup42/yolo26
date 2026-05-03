@@ -47,6 +47,7 @@ def test_tiny_training_eager_fallback_path(tmp_path):
         lr0=1e-4,
         compile_train_step=False,
         fast_data=False,
+        prefetch_data=False,
     )
     assert Path(result["last"]).exists()
 
@@ -108,3 +109,5 @@ def test_tiny_training_stage_profile_stops_after_requested_batches(tmp_path):
     assert result["history"][-1]["profile/batches_run"] == 2
     assert result["history"][-1]["profile/stopped_early"] == 1
     assert "profile/forward_ms" in result["history"][-1]
+    assert rows[0]["data_path"] == "tf_data_prefetch"
+    assert rows[0]["optimizer"] == "adamw"

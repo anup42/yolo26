@@ -38,12 +38,15 @@ USE_TFRECORD="${YOLO26_COCO_USE_TFRECORD:-1}"
 COMPILE_STEP="${YOLO26_COCO_COMPILE:-0}"
 AMP="${YOLO26_COCO_AMP:-0}"
 FAST_DATA="${YOLO26_COCO_FAST_DATA:-0}"
+PREFETCH_DATA="${YOLO26_COCO_PREFETCH_DATA:-1}"
 FAST_NMS="${YOLO26_COCO_FAST_NMS:-1}"
 PROFILE_SPEED="${YOLO26_COCO_PROFILE_SPEED:-1}"
 PROFILE_STAGE="${YOLO26_COCO_PROFILE_STAGE:-0}"
 PROFILE_BATCHES="${YOLO26_COCO_PROFILE_BATCHES:-0}"
+SYNC_PROFILE_STAGE="${YOLO26_COCO_SYNC_PROFILE_STAGE:-0}"
 GPU_MONITOR="${YOLO26_COCO_GPU_MONITOR:-0}"
 GPU_MONITOR_INTERVAL="${YOLO26_COCO_GPU_MONITOR_INTERVAL:-5}"
+OPTIMIZER="${YOLO26_COCO_OPTIMIZER:-sgd}"
 
 mkdir -p "$OUT_DIR"
 LOG_FILE="${YOLO26_COCO_LOG:-$OUT_DIR/train_coco_yolo26n.log}"
@@ -238,7 +241,7 @@ python -m yolo26_tf.cli detect train \
   --batch "$BATCH" \
   --project "$PROJECT" \
   --name "$NAME" \
-  --optimizer "${YOLO26_COCO_OPTIMIZER:-auto}" \
+  --optimizer "$OPTIMIZER" \
   --lr0 "${YOLO26_COCO_LR0:-0.01}" \
   --lrf "${YOLO26_COCO_LRF:-0.01}" \
   --momentum "${YOLO26_COCO_MOMENTUM:-0.937}" \
@@ -255,9 +258,11 @@ python -m yolo26_tf.cli detect train \
   $([[ "$USE_TFRECORD" == "1" ]] && echo "--use-tfrecord" || echo "--no-tfrecord") \
   $([[ "$COMPILE_STEP" == "1" ]] && echo "--compile" || echo "--no-compile") \
   $([[ "$FAST_DATA" == "1" ]] && echo "--fast-data" || echo "--no-fast-data") \
+  $([[ "$PREFETCH_DATA" == "1" ]] && echo "--prefetch-data" || echo "--no-prefetch-data") \
   $([[ "$FAST_NMS" == "1" ]] && echo "--fast-nms" || echo "--no-fast-nms") \
   $([[ "$PROFILE_SPEED" == "1" ]] && echo "--profile-speed" || echo "--no-profile-speed") \
   $([[ "$PROFILE_STAGE" == "1" ]] && echo "--profile-stage" || echo "") \
+  $([[ "$SYNC_PROFILE_STAGE" == "1" ]] && echo "--sync-profile-stage" || echo "") \
   --profile-batches "$PROFILE_BATCHES"
 
 cleanup

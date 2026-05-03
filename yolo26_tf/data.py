@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import random
 import hashlib
+from collections import OrderedDict
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -273,7 +274,11 @@ class YOLODataset:
         self.tfrecord_dir = tfrecord_dir
         self.tfrecord_path = self._resolve_tfrecord_path()
         self._record_image_bytes: list[bytes] | None = None
-        self.image_cache: dict[int, np.ndarray] = {}
+        self.image_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self.image_cache_bytes = 0
+        self.image_cache_hits = 0
+        self.image_cache_misses = 0
+        self.image_cache_limit = int(max(self.cache_ram_gb, 0.0) * (1024**3)) if self.cache_images != "off" else 0
         self.rng = random.Random(self.seed)
         self.hyp = {
             "hsv_h": 0.015,
@@ -376,34 +381,60 @@ class YOLODataset:
 
     def _read_image(self, idx: int) -> np.ndarray:
         if idx in self.image_cache:
-            return self.image_cache[idx].copy()
+            self.image_cache_hits += 1
+            img = self.image_cache.pop(idx)
+            self.image_cache[idx] = img
+            return img.copy()
+        self.image_cache_misses += 1
         if self._record_image_bytes is not None:
-            return np.asarray(Image.open(BytesIO(self._record_image_bytes[idx])).convert("RGB"))
-        return np.asarray(Image.open(self.im_files[idx]).convert("RGB"))
+            img = np.asarray(Image.open(BytesIO(self._record_image_bytes[idx])).convert("RGB"))
+        else:
+            img = np.asarray(Image.open(self.im_files[idx]).convert("RGB"))
+        self._maybe_cache_image(idx, img)
+        return img
+
+    def _maybe_cache_image(self, idx: int, img: np.ndarray):
+        if self.cache_images == "off" or self.image_cache_limit <= 0:
+            return
+        nbytes = int(img.nbytes)
+        if nbytes > self.image_cache_limit:
+            return
+        if idx in self.image_cache:
+            old = self.image_cache.pop(idx)
+            self.image_cache_bytes -= int(old.nbytes)
+        while self.image_cache and self.image_cache_bytes + nbytes > self.image_cache_limit:
+            _, old = self.image_cache.popitem(last=False)
+            self.image_cache_bytes -= int(old.nbytes)
+        self.image_cache[idx] = img.copy()
+        self.image_cache_bytes += nbytes
 
     def _build_image_cache(self):
-        if self._record_image_bytes is not None or self.cache_images == "off":
+        if self.cache_images != "ram" or self.image_cache_limit <= 0:
             return
-        limit = int(max(self.cache_ram_gb, 0.0) * (1024**3))
-        if limit <= 0:
-            return
-        total = 0
         cached = 0
         for i in range(len(self.im_files)):
             try:
-                img = np.asarray(Image.open(self.im_files[i]).convert("RGB"))
+                if self._record_image_bytes is not None:
+                    img = np.asarray(Image.open(BytesIO(self._record_image_bytes[i])).convert("RGB"))
+                else:
+                    img = np.asarray(Image.open(self.im_files[i]).convert("RGB"))
             except Exception:
                 continue
-            nbytes = int(img.nbytes)
-            if total + nbytes > limit:
-                if self.cache_images == "ram":
-                    print(f"RAM image cache reached {total / (1024**3):.2f} GB before caching all images.", flush=True)
+            if self.image_cache_bytes + int(img.nbytes) > self.image_cache_limit:
+                print(f"RAM image cache reached {self.image_cache_bytes / (1024**3):.2f} GB before caching all images.", flush=True)
                 break
-            self.image_cache[i] = img
-            total += nbytes
+            self._maybe_cache_image(i, img)
             cached += 1
         if cached:
-            print(f"Cached {cached}/{len(self.im_files)} {self.split} images in RAM ({total / (1024**3):.2f} GB).", flush=True)
+            print(f"Cached {cached}/{len(self.im_files)} {self.split} images in RAM ({self.image_cache_bytes / (1024**3):.2f} GB).", flush=True)
+
+    def image_cache_stats(self) -> dict[str, float]:
+        return {
+            "image_cache_hits": float(self.image_cache_hits),
+            "image_cache_misses": float(self.image_cache_misses),
+            "image_cache_items": float(len(self.image_cache)),
+            "image_cache_mb": float(self.image_cache_bytes / (1024**2)),
+        }
 
     def _load_or_build_cache(self):
         cache_file = self._cache_file()

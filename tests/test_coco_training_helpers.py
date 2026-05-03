@@ -67,11 +67,19 @@ def test_tfrecord_write_read_and_dataset_source(tmp_path):
     batch = next(iter(ds))
     assert batch["img"].shape == (2, 32, 32, 3)
     assert batch["mask"].sum() == 2
+    assert ds.image_cache_stats()["image_cache_items"] > 0
+    ds._read_image(0)
+    ds._read_image(0)
+    stats_after = ds.image_cache_stats()
+    assert stats_after["image_cache_hits"] >= 1
+    assert stats_after["image_cache_misses"] >= 1
 
 
 def test_train_config_exposes_coco_parity_knobs():
     assert TrainConfig().compile_train_step is False
     assert TrainConfig().fast_data is False
+    assert TrainConfig().prefetch_data is True
+    assert TrainConfig().ema_update_interval == 1
     cfg = TrainConfig(
         amp=True,
         multi_scale=0.5,
@@ -83,8 +91,10 @@ def test_train_config_exposes_coco_parity_knobs():
         time=1.0,
         compile_train_step=True,
         fast_data=True,
+        prefetch_data=False,
         fast_nms=True,
         cache_images="auto",
+        ema_update_interval=2,
     )
     assert cfg.amp is True
     assert cfg.multi_scale == 0.5
@@ -96,8 +106,10 @@ def test_train_config_exposes_coco_parity_knobs():
     assert cfg.time == 1.0
     assert cfg.compile_train_step is True
     assert cfg.fast_data is True
+    assert cfg.prefetch_data is False
     assert cfg.fast_nms is True
     assert cfg.cache_images == "auto"
+    assert cfg.ema_update_interval == 2
 
 
 def test_cli_and_full_coco_runner_stability_defaults_are_stable():
@@ -106,11 +118,14 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     args = parser.parse_args(["--data", "data.yaml"])
     assert args.compile_train_step is False
     assert args.fast_data is False
+    assert args.prefetch_data is True
     assert args.amp is True
     assert args.profile_stage is False
     assert args.profile_batches == 0
+    assert args.ema_update_interval == 1
     assert parser.parse_args(["--data", "data.yaml", "--compile"]).compile_train_step is True
     assert parser.parse_args(["--data", "data.yaml", "--fast-data"]).fast_data is True
+    assert parser.parse_args(["--data", "data.yaml", "--no-prefetch-data"]).prefetch_data is False
     assert parser.parse_args(["--data", "data.yaml", "--no-amp"]).amp is False
     profile_args = parser.parse_args(["--data", "data.yaml", "--profile-stage", "--profile-batches", "2"])
     assert profile_args.profile_stage is True
@@ -123,8 +138,11 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert 'AMP="${YOLO26_COCO_AMP:-0}"' in script
     assert 'COMPILE_STEP="${YOLO26_COCO_COMPILE:-0}"' in script
     assert 'FAST_DATA="${YOLO26_COCO_FAST_DATA:-0}"' in script
+    assert 'PREFETCH_DATA="${YOLO26_COCO_PREFETCH_DATA:-1}"' in script
+    assert 'OPTIMIZER="${YOLO26_COCO_OPTIMIZER:-sgd}"' in script
     assert 'PROFILE_STAGE="${YOLO26_COCO_PROFILE_STAGE:-0}"' in script
     assert 'PROFILE_BATCHES="${YOLO26_COCO_PROFILE_BATCHES:-0}"' in script
+    assert 'SYNC_PROFILE_STAGE="${YOLO26_COCO_SYNC_PROFILE_STAGE:-0}"' in script
     assert 'GPU_MONITOR="${YOLO26_COCO_GPU_MONITOR:-0}"' in script
     assert "nvidia-smi --query-gpu" in script
     assert "trap cleanup EXIT" in script
@@ -134,6 +152,8 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert "YOLO26_COCO_BATCH=16" in readme
     assert "YOLO26_COCO_AMP=0" in readme
     assert "YOLO26_COCO_FAST_DATA=0" in readme
+    assert "YOLO26_COCO_PREFETCH_DATA=1" in readme
+    assert "YOLO26_COCO_OPTIMIZER=sgd" in readme
     assert "YOLO26_COCO_COMPILE=0" in readme
     assert "YOLO26_COCO_PROFILE_BATCHES=200" in readme
     assert "stage_profile.csv" in readme

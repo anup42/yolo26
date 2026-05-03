@@ -85,9 +85,11 @@ The training runner now defaults to the stability path:
 
 - stable eager TensorFlow gradient step by default: `YOLO26_COCO_COMPILE=0`;
 - stable FP32 training by default: `YOLO26_COCO_AMP=0`;
-- serial Python data iterator by default: `YOLO26_COCO_FAST_DATA=0`;
+- built-in SGD optimizer by default for throughput diagnostics: `YOLO26_COCO_OPTIMIZER=sgd`;
+- safe serial `tf.data` prefetch by default: `YOLO26_COCO_PREFETCH_DATA=1`;
+- parallel fast-data path remains opt-in: `YOLO26_COCO_FAST_DATA=0`;
 - TFRecord generation and training input when available: `YOLO26_COCO_USE_TFRECORD=1`;
-- bounded record/image RAM cache: `YOLO26_COCO_CACHE_IMAGES=auto`, `YOLO26_COCO_CACHE_RAM_GB=32`;
+- bounded TFRecord decoded-image LRU cache: `YOLO26_COCO_CACHE_IMAGES=auto`, `YOLO26_COCO_CACHE_RAM_GB=32`;
 - TensorFlow graph NMS during validation: `YOLO26_COCO_FAST_NMS=1`;
 - speed profiling in batch logs plus `results.csv`/`results.json`: `speed/data_ms_per_batch`, `speed/train_ms_per_batch`, `speed/images_per_sec`, and `speed/val_ms`.
 
@@ -105,7 +107,7 @@ Training logs are streamed to:
 runs/train/yolo26n_tf_coco/train_coco_yolo26n.log
 ```
 
-`YOLO26_COCO_BATCH=16`, `YOLO26_COCO_AMP=0`, and `YOLO26_COCO_FAST_DATA=0` are the stable starting point for an RTX A6000 48 GB run. After a stable epoch completes, tune in this order: try batch `32`, then `YOLO26_COCO_FAST_DATA=1`, then batch `48`, then `YOLO26_COCO_AMP=1`. Keep `YOLO26_COCO_COMPILE=0` for stable training; `YOLO26_COCO_COMPILE=1` is an experimental speed path that can trigger unrecoverable TensorFlow GPU CUDA faults on some systems. If the GPU still crashes, run one diagnostic pass with `YOLO26_COCO_CUDA_SYNC=1 bash scripts/train_coco_yolo26n_linux.sh`. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
+`YOLO26_COCO_BATCH=16`, `YOLO26_COCO_AMP=0`, `YOLO26_COCO_FAST_DATA=0`, `YOLO26_COCO_PREFETCH_DATA=1`, and `YOLO26_COCO_OPTIMIZER=sgd` are the stable starting point for an RTX A6000 48 GB run. After a stable epoch completes, tune in this order: try batch `32`, then `YOLO26_COCO_FAST_DATA=1`, then batch `48`, then `YOLO26_COCO_AMP=1`. Keep `YOLO26_COCO_COMPILE=0` for stable training; `YOLO26_COCO_COMPILE=1` is an experimental speed path that can trigger unrecoverable TensorFlow GPU CUDA faults on some systems. Use `YOLO26_COCO_OPTIMIZER=auto` only for MuSGD parity runs after throughput is understood. If the GPU still crashes, run one diagnostic pass with `YOLO26_COCO_CUDA_SYNC=1 bash scripts/train_coco_yolo26n_linux.sh`. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
 
 To identify epoch-time bottlenecks without running a full epoch:
 
@@ -116,7 +118,7 @@ YOLO26_COCO_GPU_MONITOR=1 \
 bash scripts/train_coco_yolo26n_linux.sh
 ```
 
-This writes `stage_profile.csv`, `results.csv`, and `gpu_stats.csv` under `runs/train/yolo26n_tf_coco/scratch_full/`, then skips final validation/export. Use the stage summary plus GPU utilization to classify the bottleneck: high forward/backward time with high GPU utilization is model compute, high train time with low GPU utilization is TensorFlow/CPU synchronization, high `data_fetch_ms` is input/augmentation, and high `optimizer_apply_ms` is update overhead.
+This writes `stage_profile.csv`, `results.csv`, and `gpu_stats.csv` under `runs/train/yolo26n_tf_coco/scratch_full/`, then skips final validation/export. Use `YOLO26_COCO_SYNC_PROFILE_STAGE=1` only for a slower diagnostic run that forces TensorFlow stage synchronization. Use the stage summary plus GPU utilization to classify the bottleneck: high forward/backward time with high GPU utilization is model compute, high train time with low GPU utilization is TensorFlow/CPU synchronization, high `data_fetch_ms` is input/augmentation, and high `optimizer_apply_ms` is update overhead.
 
 The script:
 
