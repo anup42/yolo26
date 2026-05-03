@@ -67,6 +67,8 @@ def add_train_args(parser):
     parser.add_argument("--profile-batches", type=int, default=0)
     parser.add_argument("--sync-profile-stage", action="store_true", help="Synchronize TensorFlow tensors after profiled stages for diagnostic timing.")
     parser.add_argument("--ema-update-interval", type=int, default=1)
+    parser.add_argument("--graph-optimizer-apply", dest="graph_optimizer_apply", action="store_true", default=True, help="Graph only the optimizer-apply stage for custom optimizers.")
+    parser.add_argument("--no-graph-optimizer-apply", dest="graph_optimizer_apply", action="store_false")
     parser.add_argument("--cls-pw", type=float, default=0.0)
     parser.add_argument("--mosaic", type=float, default=1.0)
     parser.add_argument("--mosaic-n", type=int, default=4, choices=(3, 4, 9))
@@ -222,6 +224,7 @@ def main(argv=None):
             profile_batches=args.profile_batches,
             sync_profile_stage=args.sync_profile_stage,
             ema_update_interval=args.ema_update_interval,
+            graph_optimizer_apply=args.graph_optimizer_apply,
             cls_pw=args.cls_pw,
             mosaic=args.mosaic,
             mosaic_n=args.mosaic_n,

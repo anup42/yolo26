@@ -81,6 +81,7 @@ class TrainConfig:
     profile_batches: int = 0
     sync_profile_stage: bool = False
     ema_update_interval: int = 1
+    graph_optimizer_apply: bool = True
 
 
 DEFAULT_HYP = {
@@ -212,7 +213,9 @@ class YOLO26Trainer:
             f"cache_images={self.cfg.cache_images}, fast_nms={self.cfg.fast_nms}, "
             f"profile_speed={self.cfg.profile_speed}, profile_stage={self.cfg.profile_stage}, "
             f"profile_batches={self.cfg.profile_batches}, sync_profile_stage={self.cfg.sync_profile_stage}, "
-            f"ema_update_interval={self.cfg.ema_update_interval}, gpu_memory_growth={gpu_memory_growth_status()}",
+            f"ema_update_interval={self.cfg.ema_update_interval}, "
+            f"graph_optimizer_apply={self.cfg.graph_optimizer_apply}, "
+            f"gpu_memory_growth={gpu_memory_growth_status()}",
             flush=True,
         )
         if self.cfg.compile_train_step:
@@ -551,16 +554,21 @@ class YOLO26Trainer:
 
     def _apply_accumulated(self, lr: float, profile: bool = False):
         t = time.perf_counter()
-        grads = [g.read_value() for g in self.accum_grads]
-        if lr > 0 and self.bias_lr != lr:
-            bias_scale = float(self.bias_lr / lr)
-            grads = [g * bias_scale if is_bias_variable(v) else g for g, v in zip(grads, self.model.trainable_variables)]
-        grads, _ = tf.clip_by_global_norm(grads, self.cfg.clip_grad)
-        apply_decoupled_weight_decay(self.model.trainable_variables, lr, self.cfg.weight_decay)
-        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        if self._can_graph_optimizer_apply():
+            token = self._graph_apply_accumulated(tf.cast(lr, tf.float32), tf.cast(self.bias_lr, tf.float32))
+            if profile and self.cfg.sync_profile_stage:
+                sync_tensors(token)
+        else:
+            grads = [g.read_value() for g in self.accum_grads]
+            if lr > 0 and self.bias_lr != lr:
+                bias_scale = float(self.bias_lr / lr)
+                grads = [g * bias_scale if is_bias_variable(v) else g for g, v in zip(grads, self.model.trainable_variables)]
+            grads, _ = tf.clip_by_global_norm(grads, self.cfg.clip_grad)
+            apply_decoupled_weight_decay(self.model.trainable_variables, lr, self.cfg.weight_decay)
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+            for g in self.accum_grads:
+                g.assign(tf.zeros_like(g))
         self.optimizer_steps += 1
-        for g in self.accum_grads:
-            g.assign(tf.zeros_like(g))
         self.accum_counter = 0
         optimizer_apply_ms = (time.perf_counter() - t) * 1000.0
         ema_ms = 0.0
@@ -572,6 +580,29 @@ class YOLO26Trainer:
         if profile:
             return {"optimizer_apply_ms": optimizer_apply_ms, "ema_ms": ema_ms}
         return None
+
+    def _can_graph_optimizer_apply(self) -> bool:
+        if not self.cfg.graph_optimizer_apply:
+            return False
+        return not isinstance(inner_optimizer(self.optimizer), tf.keras.optimizers.Optimizer)
+
+    @tf.function(reduce_retracing=True, jit_compile=False)
+    def _graph_apply_accumulated(self, lr, bias_lr):
+        grads = [g.read_value() for g in self.accum_grads]
+        safe_lr = tf.maximum(tf.cast(lr, tf.float32), tf.constant(1e-12, tf.float32))
+        bias_scale = tf.where(tf.greater(lr, 0.0), tf.cast(bias_lr, tf.float32) / safe_lr, tf.constant(1.0, tf.float32))
+        scaled_grads = []
+        for grad, var in zip(grads, self.model.trainable_variables):
+            grad = tf.cast(grad, var.dtype)
+            if is_bias_variable(var):
+                grad = grad * tf.cast(bias_scale, var.dtype)
+            scaled_grads.append(grad)
+        scaled_grads, _ = tf.clip_by_global_norm(scaled_grads, self.cfg.clip_grad)
+        apply_decoupled_weight_decay(self.model.trainable_variables, lr, self.cfg.weight_decay)
+        self.optimizer.apply_gradients(zip(scaled_grads, self.model.trainable_variables))
+        for g in self.accum_grads:
+            g.assign(tf.zeros_like(g))
+        return tf.constant(0.0)
 
     def _flush_accumulated(self, lr: float):
         if self.accum_grads and any(float(tf.reduce_sum(tf.abs(g)).numpy()) > 0 for g in self.accum_grads):

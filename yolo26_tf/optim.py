@@ -51,6 +51,14 @@ class MuSGD:
                 self.state[key].assign(pending)
         return self.state[key]
 
+    def build(self, variables):
+        for var in variables:
+            if len(var.shape) >= 2:
+                self._state(var, "muon")
+                self._state(var, "sgd")
+            else:
+                self._state(var, "sgd_only")
+
     def state_dict(self):
         """Return numpy state for checkpoint resume."""
         return {"|".join(k): v.numpy() for k, v in self.state.items()}
@@ -120,6 +128,10 @@ class FastSGD:
             if pending is not None:
                 self.state[key].assign(pending)
         return self.state[key]
+
+    def build(self, variables):
+        for var in variables:
+            self._state(var)
 
     def state_dict(self):
         return {"|".join(k): v.numpy() for k, v in self.state.items()}

@@ -86,7 +86,7 @@ def test_tiny_training_stage_profile_stops_after_requested_batches(tmp_path):
         mosaic=0.0,
         mixup=0.0,
         cutmix=0.0,
-        optimizer="adamw",
+        optimizer="sgd",
         lr0=1e-4,
         val=False,
         profile_stage=True,
@@ -110,4 +110,4 @@ def test_tiny_training_stage_profile_stops_after_requested_batches(tmp_path):
     assert result["history"][-1]["profile/stopped_early"] == 1
     assert "profile/forward_ms" in result["history"][-1]
     assert rows[0]["data_path"] == "tf_data_prefetch"
-    assert rows[0]["optimizer"] == "adamw"
+    assert rows[0]["optimizer"] == "sgd"

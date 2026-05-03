@@ -23,6 +23,7 @@ def test_sgd_default_uses_non_xla_fast_sgd():
     opt = make_optimizer("sgd", lr=0.1, momentum=0.0, weight_decay=0.0, iterations=100)
     assert isinstance(opt, FastSGD)
     var = tf.Variable([1.0], dtype=tf.float32)
+    opt.build([var])
     opt.apply_gradients([(tf.constant([0.5], dtype=tf.float32), var)])
     np.testing.assert_allclose(var.numpy(), [0.95], atol=1e-6)
     keras_opt = make_optimizer("tfsgd", lr=0.1, momentum=0.0, weight_decay=0.0, iterations=100)
