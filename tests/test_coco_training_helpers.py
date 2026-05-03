@@ -71,6 +71,7 @@ def test_tfrecord_write_read_and_dataset_source(tmp_path):
 
 def test_train_config_exposes_coco_parity_knobs():
     assert TrainConfig().compile_train_step is False
+    assert TrainConfig().fast_data is False
     cfg = TrainConfig(
         amp=True,
         multi_scale=0.5,
@@ -104,20 +105,25 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     add_train_args(parser)
     args = parser.parse_args(["--data", "data.yaml"])
     assert args.compile_train_step is False
+    assert args.fast_data is False
     assert args.amp is True
     assert parser.parse_args(["--data", "data.yaml", "--compile"]).compile_train_step is True
+    assert parser.parse_args(["--data", "data.yaml", "--fast-data"]).fast_data is True
     assert parser.parse_args(["--data", "data.yaml", "--no-amp"]).amp is False
 
     script = Path("scripts/train_coco_yolo26n_linux.sh").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
     assert 'PROFILE="${YOLO26_COCO_PROFILE:-full}"' in script
-    assert 'BATCH="${YOLO26_COCO_BATCH:-32}"' in script
+    assert 'BATCH="${YOLO26_COCO_BATCH:-16}"' in script
     assert 'AMP="${YOLO26_COCO_AMP:-0}"' in script
     assert 'COMPILE_STEP="${YOLO26_COCO_COMPILE:-0}"' in script
+    assert 'FAST_DATA="${YOLO26_COCO_FAST_DATA:-0}"' in script
+    assert "CUDA_LAUNCH_BLOCKING=1" in script
     assert '[[ "$AMP" == "1" ]] && echo "--amp" || echo "--no-amp"' in script
     assert "bash scripts/train_coco_yolo26n_linux.sh" in readme
-    assert "YOLO26_COCO_BATCH=32" in readme
+    assert "YOLO26_COCO_BATCH=16" in readme
     assert "YOLO26_COCO_AMP=0" in readme
+    assert "YOLO26_COCO_FAST_DATA=0" in readme
     assert "YOLO26_COCO_COMPILE=0" in readme
 
 

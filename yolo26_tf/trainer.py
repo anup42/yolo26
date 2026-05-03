@@ -72,7 +72,7 @@ class TrainConfig:
     log_interval: int = 10
     cls_pw: float = 0.0
     compile_train_step: bool = False
-    fast_data: bool = True
+    fast_data: bool = False
     fast_nms: bool = True
     profile_speed: bool = True
     profile_interval: int = 0
@@ -229,6 +229,14 @@ class YOLO26Trainer:
             classes=self.cfg.classes,
             single_cls=self.cfg.single_cls,
         )
+        use_fast_data = bool(self.cfg.fast_data and not train_ds.rect)
+        data_path = "tf_data_fast" if use_fast_data else ("tf_data_distributed" if self.replicas > 1 else "python_iterator")
+        print(
+            f"training data: data_path={data_path}, workers={self.cfg.workers}, "
+            f"batch={self.cfg.batch}, batches={len(train_ds)}, images={len(train_ds.im_files)}, "
+            f"rect={train_ds.rect}, drop_last={train_ds.drop_last}",
+            flush=True,
+        )
         self._set_class_weights(train_ds)
         if self.cfg.resume:
             self._load_resume_weights()
@@ -272,7 +280,6 @@ class YOLO26Trainer:
             start = time.time()
             losses = []
             print(f"epoch {epoch + 1}/{self.cfg.epochs} starting, batches={len(train_ds)}", flush=True)
-            use_fast_data = bool(self.cfg.fast_data and not train_ds.rect)
             if use_fast_data:
                 iterator = train_ds.as_fast_tf_dataset(parallel_calls=max(self.cfg.workers, 1))
             elif self.replicas > 1:
