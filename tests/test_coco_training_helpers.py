@@ -139,7 +139,7 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     script = Path("scripts/train_coco_yolo26n_linux.sh").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
     assert 'PROFILE="${YOLO26_COCO_PROFILE:-full}"' in script
-    assert 'BATCH="${YOLO26_COCO_BATCH:-16}"' in script
+    assert 'BATCH="${YOLO26_COCO_BATCH:-32}"' in script
     assert 'AMP="${YOLO26_COCO_AMP:-0}"' in script
     assert 'COMPILE_STEP="${YOLO26_COCO_COMPILE:-0}"' in script
     assert 'FAST_DATA="${YOLO26_COCO_FAST_DATA:-0}"' in script
@@ -159,6 +159,7 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert "CUDA_LAUNCH_BLOCKING=1" in script
     assert '[[ "$AMP" == "1" ]] && echo "--amp" || echo "--no-amp"' in script
     assert "bash scripts/train_coco_yolo26n_linux.sh" in readme
+    assert "YOLO26_COCO_BATCH=32" in readme
     assert "YOLO26_COCO_BATCH=16" in readme
     assert "YOLO26_COCO_AMP=0" in readme
     assert "YOLO26_COCO_FAST_DATA=0" in readme
@@ -168,7 +169,7 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert "YOLO26_COCO_GRAPH_OPTIMIZER_APPLY=1" in readme
     assert "YOLO26_COCO_COMPILE=0" in readme
     assert "YOLO26_COCO_PROFILE_BATCHES=200" in readme
-    assert "YOLO26 package version: 0.1.2" in readme
+    assert "YOLO26 package version: 0.1.3" in readme
     assert "graph_optimizer_apply=True" in readme
     assert "data_path=tf_data_prefetch" in readme
     assert "stage_profile.csv" in readme
