@@ -61,6 +61,8 @@ def add_train_args(parser):
     parser.add_argument("--profile-speed", dest="profile_speed", action="store_true", default=True)
     parser.add_argument("--no-profile-speed", dest="profile_speed", action="store_false")
     parser.add_argument("--profile-interval", type=int, default=0)
+    parser.add_argument("--profile-stage", action="store_true")
+    parser.add_argument("--profile-batches", type=int, default=0)
     parser.add_argument("--cls-pw", type=float, default=0.0)
     parser.add_argument("--mosaic", type=float, default=1.0)
     parser.add_argument("--mosaic-n", type=int, default=4, choices=(3, 4, 9))
@@ -211,6 +213,8 @@ def main(argv=None):
             fast_nms=args.fast_nms,
             profile_speed=args.profile_speed,
             profile_interval=args.profile_interval,
+            profile_stage=args.profile_stage,
+            profile_batches=args.profile_batches,
             cls_pw=args.cls_pw,
             mosaic=args.mosaic,
             mosaic_n=args.mosaic_n,

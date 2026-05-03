@@ -76,6 +76,8 @@ class TrainConfig:
     fast_nms: bool = True
     profile_speed: bool = True
     profile_interval: int = 0
+    profile_stage: bool = False
+    profile_batches: int = 0
 
 
 DEFAULT_HYP = {
@@ -126,9 +128,11 @@ class YOLO26Trainer:
         self.ema_state = self.weights_dir / "ema_state.npz"
         self.args_file = self.save_dir / "args.json"
         self.csv_file = self.save_dir / "results.csv"
+        self.stage_profile_file = self.save_dir / "stage_profile.csv"
         self.best_fitness = -float("inf")
         self.start_epoch = 0
         self.history: list[dict[str, Any]] = []
+        self.stage_profile_rows: list[dict[str, Any]] = []
         self.strategy = self._make_strategy()
         self._rebuild_model_for_strategy_if_needed()
         self.optimizer = None
@@ -199,7 +203,8 @@ class YOLO26Trainer:
             f"mixed_precision_policy={tf.keras.mixed_precision.global_policy().name}, "
             f"fast_data={self.cfg.fast_data}, use_tfrecord={self.cfg.use_tfrecord}, "
             f"cache_images={self.cfg.cache_images}, fast_nms={self.cfg.fast_nms}, "
-            f"profile_speed={self.cfg.profile_speed}, gpu_memory_growth={gpu_memory_growth_status()}",
+            f"profile_speed={self.cfg.profile_speed}, profile_stage={self.cfg.profile_stage}, "
+            f"profile_batches={self.cfg.profile_batches}, gpu_memory_growth={gpu_memory_growth_status()}",
             flush=True,
         )
         if self.cfg.compile_train_step:
@@ -273,6 +278,8 @@ class YOLO26Trainer:
         nw = max(round(self.cfg.warmup_epochs * len(train_ds)), 100 if self.cfg.warmup_epochs > 0 else 0)
         accumulate = self.cfg.accumulate or max(round(self.cfg.nbs / max(self.cfg.batch, 1)), 1)
         patience_count = 0
+        profile_limit = int(self.cfg.profile_batches or 0)
+        profile_stop = False
         self.train_time_start = time.time()
         for epoch in range(self.start_epoch, self.cfg.epochs):
             if self.cfg.close_mosaic and epoch == max(self.cfg.epochs - self.cfg.close_mosaic, 0):
@@ -291,10 +298,13 @@ class YOLO26Trainer:
             iter_obj = iter(iterator)
             data_wait = 0.0
             train_wait = 0.0
+            batches_this_epoch = min(len(train_ds), profile_limit) if profile_limit > 0 else len(train_ds)
             data_t0 = time.perf_counter()
-            for i in range(len(train_ds)):
+            for i in range(batches_this_epoch):
+                batch_total_t0 = time.perf_counter()
                 batch_data = next(iter_obj)
-                data_wait += time.perf_counter() - data_t0
+                batch_data_fetch = time.perf_counter() - data_t0
+                data_wait += batch_data_fetch
                 ni = epoch * len(train_ds) + i
                 lr = self._set_lr_momentum(ni, nw)
                 current_accumulate = accumulate
@@ -305,25 +315,49 @@ class YOLO26Trainer:
                     if self.replicas > 1:
                         per_replica = self.strategy.run(self._train_step, args=(batch_data, current_accumulate, lr))
                         loss_items = self.strategy.reduce(tf.distribute.ReduceOp.MEAN, per_replica, axis=None)
+                        stage_row = None
+                    elif self.cfg.profile_stage:
+                        loss_items, stage_row = self._profiled_train_step(batch_data, current_accumulate, lr)
                     else:
                         batch_tf = to_tensor_batch(batch_data)
                         loss_items = self._train_step(batch_tf, current_accumulate, lr)
+                        stage_row = None
                 except FloatingPointError:
                     if self._recover_from_nan(epoch):
                         continue
                     raise
-                train_wait += time.perf_counter() - train_t0
+                batch_train_wait = time.perf_counter() - train_t0
+                train_wait += batch_train_wait
                 losses.append(np.asarray(loss_items.numpy(), dtype=np.float32))
+                batch_total_ms = (time.perf_counter() - batch_total_t0) * 1000.0
                 try:
                     batch_size_seen = int(batch_data["img"].shape[0]) if batch_data["img"].shape[0] is not None else self.cfg.batch
                 except Exception:
                     batch_size_seen = self.cfg.batch
                 images_per_sec = batch_size_seen / max(train_wait / max(i + 1, 1), 1e-9)
+                if self.cfg.profile_stage:
+                    if stage_row is None:
+                        stage_row = empty_stage_profile_row()
+                    stage_row.update(
+                        {
+                            "epoch": epoch + 1,
+                            "batch": i + 1,
+                            "batches": len(train_ds),
+                            "lr": float(lr),
+                            "data_fetch_ms": batch_data_fetch * 1000.0,
+                            "batch_total_ms": batch_total_ms,
+                            "box_loss": float(loss_items[0]),
+                            "cls_loss": float(loss_items[1]),
+                            "dfl_loss": float(loss_items[2]),
+                        }
+                    )
+                    self.stage_profile_rows.append(stage_row)
+                    self._append_stage_profile(stage_row)
                 profile_interval = self.cfg.profile_interval or self.cfg.log_interval
-                if i == 0 or (self.cfg.log_interval > 0 and (i + 1) % self.cfg.log_interval == 0) or (i + 1) == len(train_ds):
+                if i == 0 or (self.cfg.log_interval > 0 and (i + 1) % self.cfg.log_interval == 0) or (i + 1) == batches_this_epoch:
                     li = losses[-1]
                     speed = ""
-                    if self.cfg.profile_speed and (profile_interval <= 0 or i == 0 or (i + 1) % profile_interval == 0 or (i + 1) == len(train_ds)):
+                    if self.cfg.profile_speed and (profile_interval <= 0 or i == 0 or (i + 1) % profile_interval == 0 or (i + 1) == batches_this_epoch):
                         speed = (
                             f" data_ms={data_wait * 1000 / max(i + 1, 1):.1f}"
                             f" train_ms={train_wait * 1000 / max(i + 1, 1):.1f}"
@@ -335,12 +369,17 @@ class YOLO26Trainer:
                         flush=True,
                     )
                 data_t0 = time.perf_counter()
+            profile_stop = profile_limit > 0 and batches_this_epoch < len(train_ds)
             self._flush_accumulated(lr=self._current_lr())
             if self.loss_fn:
                 self.loss_fn.update()
             train_loss = np.mean(losses, axis=0).tolist() if losses else [0.0, 0.0, 0.0]
             val_start = time.perf_counter()
-            metrics = self._validate(epoch) if self.cfg.val and self.data.get("val") else {"fitness": -float(sum(train_loss))}
+            metrics = (
+                self._validate(epoch)
+                if self.cfg.val and self.data.get("val") and not profile_stop
+                else {"fitness": -float(sum(train_loss))}
+            )
             val_ms = (time.perf_counter() - val_start) * 1000.0
             fitness = float(metrics.get("fitness", metrics.get("metrics/mAP50-95(B)", 0.0)))
             improved = fitness >= self.best_fitness
@@ -357,12 +396,15 @@ class YOLO26Trainer:
                 "cls_loss": float(train_loss[1]),
                 "dfl_loss": float(train_loss[2]),
                 **metrics,
-                "speed/data_ms_per_batch": float(data_wait * 1000 / max(len(train_ds), 1)),
-                "speed/train_ms_per_batch": float(train_wait * 1000 / max(len(train_ds), 1)),
-                "speed/images_per_sec": float((len(train_ds.indices) if hasattr(train_ds, "indices") else len(train_ds) * self.cfg.batch) / max(train_wait, 1e-9)),
+                "speed/data_ms_per_batch": float(data_wait * 1000 / max(batches_this_epoch, 1)),
+                "speed/train_ms_per_batch": float(train_wait * 1000 / max(batches_this_epoch, 1)),
+                "speed/images_per_sec": float((batches_this_epoch * self.cfg.batch) / max(train_wait, 1e-9)),
                 "speed/val_ms": float(val_ms),
+                "profile/batches_run": int(batches_this_epoch),
+                "profile/stopped_early": int(profile_stop),
                 "time": time.time() - start,
             }
+            row.update(stage_profile_averages(self.stage_profile_rows))
             self.history.append(row)
             (self.save_dir / "results.json").write_text(json.dumps(self.history, indent=2), encoding="utf-8")
             self._append_csv(row)
@@ -377,7 +419,11 @@ class YOLO26Trainer:
             if self.cfg.time and (time.time() - self.train_time_start) > self.cfg.time * 3600:
                 print(f"timed stopping: reached {self.cfg.time} training hours")
                 break
-        final_metrics = self._final_eval() if self.cfg.val and self.best.exists() and self.data.get("val") else {}
+            if profile_stop:
+                print(f"profiling stop: reached profile_batches={profile_limit}", flush=True)
+                break
+        self._print_stage_profile_summary()
+        final_metrics = self._final_eval() if (not profile_stop) and self.cfg.val and self.best.exists() and self.data.get("val") else {}
         return {"save_dir": str(self.save_dir), "best": str(self.best), "last": str(self.last), "history": self.history, "final_metrics": final_metrics}
 
     def _train_step(self, batch_tf: dict, accumulate: int, lr: float):
@@ -399,6 +445,45 @@ class YOLO26Trainer:
         if not tf.reduce_all(tf.math.is_finite(loss_items)):
             raise FloatingPointError("Non-finite YOLO26 loss encountered")
         return tf.cast(loss_items, tf.float32)
+
+    def _profiled_train_step(self, batch_data: dict, accumulate: int, lr: float):
+        stage = empty_stage_profile_row()
+        t = time.perf_counter()
+        batch_tf = to_tensor_batch(batch_data)
+        if self.cfg.multi_scale > 0.0:
+            batch_tf = multiscale_batch(batch_tf, self.cfg.imgsz, factor=self.cfg.multi_scale)
+        stage["to_tensor_ms"] = (time.perf_counter() - t) * 1000.0
+
+        with tf.GradientTape() as tape:
+            t = time.perf_counter()
+            preds = self.model(batch_tf["img"], training=True)
+            stage["forward_ms"] = (time.perf_counter() - t) * 1000.0
+
+            t = time.perf_counter()
+            loss, loss_items = self.loss_fn(preds, batch_tf)
+            loss = tf.cast(loss, tf.float32) / float(accumulate)
+            scaled_loss = scale_loss(self.optimizer, loss)
+            stage["loss_ms"] = (time.perf_counter() - t) * 1000.0
+
+        t = time.perf_counter()
+        grads = tape.gradient(scaled_loss, self.model.trainable_variables)
+        grads = unscale_grads(self.optimizer, grads)
+        grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, self.model.trainable_variables)]
+        stage["backward_ms"] = (time.perf_counter() - t) * 1000.0
+
+        t = time.perf_counter()
+        for acc, grad in zip(self.accum_grads, grads):
+            if grad is not None:
+                acc.assign_add(tf.cast(grad, acc.dtype))
+        self.accum_counter += 1
+        stage["grad_accum_ms"] = (time.perf_counter() - t) * 1000.0
+
+        if self.accum_counter % accumulate == 0:
+            stage.update(self._apply_accumulated(lr, profile=True))
+
+        if not tf.reduce_all(tf.math.is_finite(loss_items)):
+            raise FloatingPointError("Non-finite YOLO26 loss encountered")
+        return tf.cast(loss_items, tf.float32), stage
 
     @tf.function(reduce_retracing=True)
     def _compiled_grad_step(self, batch_tf: dict, accumulate_f):
@@ -430,7 +515,8 @@ class YOLO26Trainer:
         grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, self.model.trainable_variables)]
         return tf.cast(loss_items, tf.float32), grads
 
-    def _apply_accumulated(self, lr: float):
+    def _apply_accumulated(self, lr: float, profile: bool = False):
+        t = time.perf_counter()
         grads = [g.read_value() for g in self.accum_grads]
         if lr > 0 and self.bias_lr != lr:
             bias_scale = float(self.bias_lr / lr)
@@ -441,8 +527,15 @@ class YOLO26Trainer:
         for g in self.accum_grads:
             g.assign(tf.zeros_like(g))
         self.accum_counter = 0
+        optimizer_apply_ms = (time.perf_counter() - t) * 1000.0
+        ema_ms = 0.0
         if self.ema:
+            t = time.perf_counter()
             self.ema.update(self.model)
+            ema_ms = (time.perf_counter() - t) * 1000.0
+        if profile:
+            return {"optimizer_apply_ms": optimizer_apply_ms, "ema_ms": ema_ms}
+        return None
 
     def _flush_accumulated(self, lr: float):
         if self.accum_grads and any(float(tf.reduce_sum(tf.abs(g)).numpy()) > 0 for g in self.accum_grads):
@@ -670,6 +763,43 @@ class YOLO26Trainer:
                 writer.writeheader()
             writer.writerow(row)
 
+    def _append_stage_profile(self, row: dict[str, Any]):
+        write_header = not self.stage_profile_file.exists()
+        fields = stage_profile_fields()
+        with self.stage_profile_file.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, 0.0) for k in fields})
+
+    def _print_stage_profile_summary(self):
+        if not self.stage_profile_rows:
+            return
+        avg = stage_profile_averages(self.stage_profile_rows)
+        stage_keys = [
+            "profile/data_fetch_ms",
+            "profile/to_tensor_ms",
+            "profile/forward_ms",
+            "profile/loss_ms",
+            "profile/backward_ms",
+            "profile/grad_accum_ms",
+            "profile/optimizer_apply_ms",
+            "profile/ema_ms",
+        ]
+        top = max(stage_keys, key=lambda k: avg.get(k, 0.0))
+        print(
+            "stage profile summary: "
+            f"batches={len(self.stage_profile_rows)}, top_stage={top.replace('profile/', '')}, "
+            f"top_ms={avg.get(top, 0.0):.1f}, batch_total_ms={avg.get('profile/batch_total_ms', 0.0):.1f}",
+            flush=True,
+        )
+        print(
+            "stage profile interpretation: high forward/backward with high GPU util is model-compute bound; "
+            "high train time with low GPU util suggests TensorFlow sync/CPU overhead; "
+            "high data_fetch_ms is input/augmentation bound; high optimizer_apply_ms is update overhead.",
+            flush=True,
+        )
+
     def _final_eval(self) -> dict[str, Any]:
         current = self.model.get_weights()
         try:
@@ -700,6 +830,50 @@ class YOLO26Trainer:
 def to_tensor_batch(batch: dict) -> dict:
     tensor_keys = {"img", "bboxes", "cls", "mask", "batch_idx", "flat_cls", "flat_bboxes"}
     return {k: tf.convert_to_tensor(v) if k in tensor_keys else v for k, v in batch.items()}
+
+
+def stage_profile_fields() -> list[str]:
+    return [
+        "epoch",
+        "batch",
+        "batches",
+        "lr",
+        "data_fetch_ms",
+        "to_tensor_ms",
+        "forward_ms",
+        "loss_ms",
+        "backward_ms",
+        "grad_accum_ms",
+        "optimizer_apply_ms",
+        "ema_ms",
+        "batch_total_ms",
+        "box_loss",
+        "cls_loss",
+        "dfl_loss",
+    ]
+
+
+def empty_stage_profile_row() -> dict[str, float]:
+    return {k: 0.0 for k in stage_profile_fields()}
+
+
+def stage_profile_averages(rows: list[dict[str, Any]]) -> dict[str, float]:
+    if not rows:
+        return {}
+    keys = [
+        "data_fetch_ms",
+        "to_tensor_ms",
+        "forward_ms",
+        "loss_ms",
+        "backward_ms",
+        "grad_accum_ms",
+        "optimizer_apply_ms",
+        "ema_ms",
+        "batch_total_ms",
+    ]
+    out = {f"profile/{k}": float(np.mean([float(r.get(k, 0.0)) for r in rows])) for k in keys}
+    out["profile/stage_batches"] = float(len(rows))
+    return out
 
 
 def multiscale_batch(batch: dict, base_imgsz: int, factor: float = 0.5, stride: int = 32) -> dict:

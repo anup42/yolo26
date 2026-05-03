@@ -40,17 +40,85 @@ AMP="${YOLO26_COCO_AMP:-0}"
 FAST_DATA="${YOLO26_COCO_FAST_DATA:-0}"
 FAST_NMS="${YOLO26_COCO_FAST_NMS:-1}"
 PROFILE_SPEED="${YOLO26_COCO_PROFILE_SPEED:-1}"
+PROFILE_STAGE="${YOLO26_COCO_PROFILE_STAGE:-0}"
+PROFILE_BATCHES="${YOLO26_COCO_PROFILE_BATCHES:-0}"
+GPU_MONITOR="${YOLO26_COCO_GPU_MONITOR:-0}"
+GPU_MONITOR_INTERVAL="${YOLO26_COCO_GPU_MONITOR_INTERVAL:-5}"
 
 mkdir -p "$OUT_DIR"
 LOG_FILE="${YOLO26_COCO_LOG:-$OUT_DIR/train_coco_yolo26n.log}"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "Logging to $LOG_FILE"
+GPU_MONITOR_PID=""
+GPU_STATS="$OUT_DIR/gpu_stats.csv"
+
+cleanup() {
+  if [[ -n "${GPU_MONITOR_PID:-}" ]]; then
+    kill "$GPU_MONITOR_PID" >/dev/null 2>&1 || true
+    wait "$GPU_MONITOR_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2
     exit 1
   }
+}
+
+start_gpu_monitor() {
+  if [[ "$GPU_MONITOR" != "1" ]]; then
+    return
+  fi
+  require_cmd nvidia-smi
+  echo "timestamp,gpu_util,memory_util,memory_used_mb,power_w,temp_c" > "$GPU_STATS"
+  (
+    while true; do
+      nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,power.draw,temperature.gpu --format=csv,noheader,nounits >> "$GPU_STATS" 2>/dev/null || true
+      sleep "$GPU_MONITOR_INTERVAL"
+    done
+  ) &
+  GPU_MONITOR_PID="$!"
+  echo "GPU monitor writing to $GPU_STATS every ${GPU_MONITOR_INTERVAL}s"
+}
+
+summarize_gpu_stats() {
+  if [[ "$GPU_MONITOR" != "1" || ! -s "$GPU_STATS" ]]; then
+    return
+  fi
+  python - "$GPU_STATS" <<'PY'
+import csv
+import sys
+
+path = sys.argv[1]
+rows = []
+with open(path, newline="", encoding="utf-8") as f:
+    for row in csv.DictReader(f):
+        try:
+            rows.append({
+                "gpu": float(row["gpu_util"]),
+                "mem": float(row["memory_util"]),
+                "used": float(row["memory_used_mb"]),
+                "power": float(row["power_w"]),
+                "temp": float(row["temp_c"]),
+            })
+        except Exception:
+            pass
+if not rows:
+    print("GPU monitor summary: no samples")
+    raise SystemExit
+avg = {k: sum(r[k] for r in rows) / len(rows) for k in rows[0]}
+print(
+    "GPU monitor summary: "
+    f"samples={len(rows)}, avg_gpu_util={avg['gpu']:.1f}%, avg_mem_util={avg['mem']:.1f}%, "
+    f"avg_mem_used_mb={avg['used']:.0f}, avg_power_w={avg['power']:.1f}, avg_temp_c={avg['temp']:.1f}"
+)
+if avg["gpu"] >= 70:
+    print("GPU monitor interpretation: high GPU utilization; bottleneck is likely model compute.")
+else:
+    print("GPU monitor interpretation: low GPU utilization; inspect stage_profile.csv for CPU/TensorFlow sync bottlenecks.")
+PY
 }
 
 download_file() {
@@ -160,6 +228,8 @@ else
   EPOCHS="$EPOCHS_SMALL"
 fi
 
+start_gpu_monitor
+
 python -m yolo26_tf.cli detect train \
   --model yolo26n.yaml \
   --data "$DATA_YAML" \
@@ -186,7 +256,18 @@ python -m yolo26_tf.cli detect train \
   $([[ "$COMPILE_STEP" == "1" ]] && echo "--compile" || echo "--no-compile") \
   $([[ "$FAST_DATA" == "1" ]] && echo "--fast-data" || echo "--no-fast-data") \
   $([[ "$FAST_NMS" == "1" ]] && echo "--fast-nms" || echo "--no-fast-nms") \
-  $([[ "$PROFILE_SPEED" == "1" ]] && echo "--profile-speed" || echo "--no-profile-speed")
+  $([[ "$PROFILE_SPEED" == "1" ]] && echo "--profile-speed" || echo "--no-profile-speed") \
+  $([[ "$PROFILE_STAGE" == "1" ]] && echo "--profile-stage" || echo "") \
+  --profile-batches "$PROFILE_BATCHES"
+
+cleanup
+summarize_gpu_stats
+
+if [[ "$PROFILE_BATCHES" != "0" ]]; then
+  echo "Profiling run complete after ${PROFILE_BATCHES} batch(es); skipping final validation and export."
+  echo "Profiler outputs: $PROJECT/$NAME/stage_profile.csv and $PROJECT/$NAME/results.csv"
+  exit 0
+fi
 
 BEST="$PROJECT/$NAME/weights/best.weights.h5"
 python -m yolo26_tf.cli detect val \

@@ -1,4 +1,5 @@
-﻿from pathlib import Path
+import csv
+from pathlib import Path
 
 import pytest
 
@@ -69,3 +70,41 @@ def test_tiny_training_compiled_opt_in_path(tmp_path):
         fast_data=False,
     )
     assert Path(result["last"]).exists()
+
+
+def test_tiny_training_stage_profile_stops_after_requested_batches(tmp_path):
+    data = create_tiny_dataset(tmp_path / "tiny_profile", n=4, size=32)
+    y = YOLO26("yolo26n.yaml", nc=1, imgsz=32)
+    result = y.train(
+        data=data,
+        epochs=2,
+        imgsz=32,
+        batch=1,
+        project=tmp_path / "runs",
+        name="profile",
+        mosaic=0.0,
+        mixup=0.0,
+        cutmix=0.0,
+        optimizer="adamw",
+        lr0=1e-4,
+        val=False,
+        profile_stage=True,
+        profile_batches=2,
+    )
+    save_dir = Path(result["save_dir"])
+    profile_csv = save_dir / "stage_profile.csv"
+    assert profile_csv.exists()
+    rows = list(csv.DictReader(profile_csv.open(newline="", encoding="utf-8")))
+    assert len(rows) == 2
+    assert {
+        "data_fetch_ms",
+        "to_tensor_ms",
+        "forward_ms",
+        "loss_ms",
+        "backward_ms",
+        "optimizer_apply_ms",
+        "batch_total_ms",
+    } <= set(rows[0])
+    assert result["history"][-1]["profile/batches_run"] == 2
+    assert result["history"][-1]["profile/stopped_early"] == 1
+    assert "profile/forward_ms" in result["history"][-1]

@@ -107,6 +107,17 @@ runs/train/yolo26n_tf_coco/train_coco_yolo26n.log
 
 `YOLO26_COCO_BATCH=16`, `YOLO26_COCO_AMP=0`, and `YOLO26_COCO_FAST_DATA=0` are the stable starting point for an RTX A6000 48 GB run. After a stable epoch completes, tune in this order: try batch `32`, then `YOLO26_COCO_FAST_DATA=1`, then batch `48`, then `YOLO26_COCO_AMP=1`. Keep `YOLO26_COCO_COMPILE=0` for stable training; `YOLO26_COCO_COMPILE=1` is an experimental speed path that can trigger unrecoverable TensorFlow GPU CUDA faults on some systems. If the GPU still crashes, run one diagnostic pass with `YOLO26_COCO_CUDA_SYNC=1 bash scripts/train_coco_yolo26n_linux.sh`. The full profile writes full COCO TFRecords by default; subset profiles write subset TFRecords. If system RAM is too constrained for the record cache, lower `YOLO26_COCO_CACHE_RAM_GB` or set `YOLO26_COCO_USE_TFRECORD=0` to use the image-file path.
 
+To identify epoch-time bottlenecks without running a full epoch:
+
+```bash
+YOLO26_COCO_PROFILE_BATCHES=200 \
+YOLO26_COCO_PROFILE_STAGE=1 \
+YOLO26_COCO_GPU_MONITOR=1 \
+bash scripts/train_coco_yolo26n_linux.sh
+```
+
+This writes `stage_profile.csv`, `results.csv`, and `gpu_stats.csv` under `runs/train/yolo26n_tf_coco/scratch_full/`, then skips final validation/export. Use the stage summary plus GPU utilization to classify the bottleneck: high forward/backward time with high GPU utilization is model compute, high train time with low GPU utilization is TensorFlow/CPU synchronization, high `data_fetch_ms` is input/augmentation, and high `optimizer_apply_ms` is update overhead.
+
 The script:
 
 - creates a fresh virtualenv;
