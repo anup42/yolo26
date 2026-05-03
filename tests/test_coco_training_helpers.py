@@ -73,12 +73,20 @@ def test_tfrecord_write_read_and_dataset_source(tmp_path):
     stats_after = ds.image_cache_stats()
     assert stats_after["image_cache_hits"] >= 1
     assert stats_after["image_cache_misses"] >= 1
+    ds.close()
+
+    threaded_ds = YOLODataset(data, "train", imgsz=32, batch=2, augment=True, hyp={"mosaic": 0.0, "mixup": 0.0, "cutmix": 0.0}, shuffle=False, use_tfrecord=True, cache_ram_gb=1, sample_workers=2)
+    threaded = next(iter(threaded_ds))
+    assert threaded["img"].shape == (2, 32, 32, 3)
+    assert threaded["mask"].sum() == 2
+    threaded_ds.close()
 
 
 def test_train_config_exposes_coco_parity_knobs():
     assert TrainConfig().compile_train_step is False
     assert TrainConfig().fast_data is False
     assert TrainConfig().prefetch_data is True
+    assert TrainConfig().sample_workers == 0
     assert TrainConfig().ema_update_interval == 1
     assert TrainConfig().graph_optimizer_apply is True
     cfg = TrainConfig(
@@ -93,6 +101,7 @@ def test_train_config_exposes_coco_parity_knobs():
         compile_train_step=True,
         fast_data=True,
         prefetch_data=False,
+        sample_workers=4,
         fast_nms=True,
         cache_images="auto",
         ema_update_interval=2,
@@ -109,6 +118,7 @@ def test_train_config_exposes_coco_parity_knobs():
     assert cfg.compile_train_step is True
     assert cfg.fast_data is True
     assert cfg.prefetch_data is False
+    assert cfg.sample_workers == 4
     assert cfg.fast_nms is True
     assert cfg.cache_images == "auto"
     assert cfg.ema_update_interval == 2
@@ -122,6 +132,7 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert args.compile_train_step is False
     assert args.fast_data is False
     assert args.prefetch_data is True
+    assert args.sample_workers == 0
     assert args.amp is True
     assert args.profile_stage is False
     assert args.profile_batches == 0
@@ -130,6 +141,7 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert parser.parse_args(["--data", "data.yaml", "--compile"]).compile_train_step is True
     assert parser.parse_args(["--data", "data.yaml", "--fast-data"]).fast_data is True
     assert parser.parse_args(["--data", "data.yaml", "--no-prefetch-data"]).prefetch_data is False
+    assert parser.parse_args(["--data", "data.yaml", "--sample-workers", "4"]).sample_workers == 4
     assert parser.parse_args(["--data", "data.yaml", "--no-graph-optimizer-apply"]).graph_optimizer_apply is False
     assert parser.parse_args(["--data", "data.yaml", "--no-amp"]).amp is False
     profile_args = parser.parse_args(["--data", "data.yaml", "--profile-stage", "--profile-batches", "2"])
@@ -144,6 +156,8 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert 'COMPILE_STEP="${YOLO26_COCO_COMPILE:-0}"' in script
     assert 'FAST_DATA="${YOLO26_COCO_FAST_DATA:-0}"' in script
     assert 'PREFETCH_DATA="${YOLO26_COCO_PREFETCH_DATA:-1}"' in script
+    assert 'SAMPLE_WORKERS="${YOLO26_COCO_SAMPLE_WORKERS:-8}"' in script
+    assert '--sample-workers "$SAMPLE_WORKERS"' in script
     assert 'OPTIMIZER="${YOLO26_COCO_OPTIMIZER:-sgd}"' in script
     assert 'EMA_UPDATE_INTERVAL="${YOLO26_COCO_EMA_UPDATE_INTERVAL:-10}"' in script
     assert 'GRAPH_OPTIMIZER_APPLY="${YOLO26_COCO_GRAPH_OPTIMIZER_APPLY:-1}"' in script
@@ -164,14 +178,15 @@ def test_cli_and_full_coco_runner_stability_defaults_are_stable():
     assert "YOLO26_COCO_AMP=0" in readme
     assert "YOLO26_COCO_FAST_DATA=0" in readme
     assert "YOLO26_COCO_PREFETCH_DATA=1" in readme
+    assert "YOLO26_COCO_SAMPLE_WORKERS=8" in readme
     assert "YOLO26_COCO_OPTIMIZER=sgd" in readme
     assert "YOLO26_COCO_EMA_UPDATE_INTERVAL=10" in readme
     assert "YOLO26_COCO_GRAPH_OPTIMIZER_APPLY=1" in readme
     assert "YOLO26_COCO_COMPILE=0" in readme
     assert "YOLO26_COCO_PROFILE_BATCHES=200" in readme
-    assert "YOLO26 package version: 0.1.3" in readme
+    assert "YOLO26 package version: 0.1.4" in readme
     assert "graph_optimizer_apply=True" in readme
-    assert "data_path=tf_data_prefetch" in readme
+    assert "data_path=tf_data_prefetch_threaded" in readme
     assert "stage_profile.csv" in readme
     assert "gpu_stats.csv" in readme
 

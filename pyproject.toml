@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yolo26-tf"
-version = "0.1.3"
+version = "0.1.4"
 description = "TensorFlow/Keras port of Ultralytics YOLO26 object detection"
 readme = "README.md"
 requires-python = ">=3.10"

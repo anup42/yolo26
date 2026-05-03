@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import random
 import hashlib
+import threading
 from collections import OrderedDict
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
@@ -254,6 +255,7 @@ class YOLODataset:
         cache_ram_gb: float = 8.0,
         use_tfrecord: bool = True,
         tfrecord_dir: str | Path | None = None,
+        sample_workers: int = 0,
     ):
         self.data = load_data_yaml(data)
         self.split = split
@@ -275,10 +277,13 @@ class YOLODataset:
         self.tfrecord_path = self._resolve_tfrecord_path()
         self._record_image_bytes: list[bytes] | None = None
         self.image_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self.image_cache_lock = threading.RLock()
         self.image_cache_bytes = 0
         self.image_cache_hits = 0
         self.image_cache_misses = 0
         self.image_cache_limit = int(max(self.cache_ram_gb, 0.0) * (1024**3)) if self.cache_images != "off" else 0
+        self.sample_workers = max(int(sample_workers or 0), 0)
+        self._sample_executor: ThreadPoolExecutor | None = None
         self.rng = random.Random(self.seed)
         self.hyp = {
             "hsv_h": 0.015,
@@ -343,6 +348,8 @@ class YOLODataset:
             self.batch_shapes = None
         self.transforms = self.build_transforms()
         self.buffer: list[int] = []
+        if self.sample_workers > 1:
+            self._sample_executor = ThreadPoolExecutor(max_workers=self.sample_workers, thread_name_prefix=f"yolo26-{self.split}-aug")
         self._build_image_cache()
         self.on_epoch_end()
 
@@ -380,12 +387,13 @@ class YOLODataset:
             return None
 
     def _read_image(self, idx: int) -> np.ndarray:
-        if idx in self.image_cache:
-            self.image_cache_hits += 1
-            img = self.image_cache.pop(idx)
-            self.image_cache[idx] = img
-            return img.copy()
-        self.image_cache_misses += 1
+        with self.image_cache_lock:
+            if idx in self.image_cache:
+                self.image_cache_hits += 1
+                img = self.image_cache.pop(idx)
+                self.image_cache[idx] = img
+                return img.copy()
+            self.image_cache_misses += 1
         if self._record_image_bytes is not None:
             img = np.asarray(Image.open(BytesIO(self._record_image_bytes[idx])).convert("RGB"))
         else:
@@ -399,14 +407,15 @@ class YOLODataset:
         nbytes = int(img.nbytes)
         if nbytes > self.image_cache_limit:
             return
-        if idx in self.image_cache:
-            old = self.image_cache.pop(idx)
-            self.image_cache_bytes -= int(old.nbytes)
-        while self.image_cache and self.image_cache_bytes + nbytes > self.image_cache_limit:
-            _, old = self.image_cache.popitem(last=False)
-            self.image_cache_bytes -= int(old.nbytes)
-        self.image_cache[idx] = img.copy()
-        self.image_cache_bytes += nbytes
+        with self.image_cache_lock:
+            if idx in self.image_cache:
+                old = self.image_cache.pop(idx)
+                self.image_cache_bytes -= int(old.nbytes)
+            while self.image_cache and self.image_cache_bytes + nbytes > self.image_cache_limit:
+                _, old = self.image_cache.popitem(last=False)
+                self.image_cache_bytes -= int(old.nbytes)
+            self.image_cache[idx] = img.copy()
+            self.image_cache_bytes += nbytes
 
     def _build_image_cache(self):
         if self.cache_images != "ram" or self.image_cache_limit <= 0:
@@ -420,21 +429,27 @@ class YOLODataset:
                     img = np.asarray(Image.open(self.im_files[i]).convert("RGB"))
             except Exception:
                 continue
-            if self.image_cache_bytes + int(img.nbytes) > self.image_cache_limit:
-                print(f"RAM image cache reached {self.image_cache_bytes / (1024**3):.2f} GB before caching all images.", flush=True)
+            with self.image_cache_lock:
+                would_exceed = self.image_cache_bytes + int(img.nbytes) > self.image_cache_limit
+                cache_gb = self.image_cache_bytes / (1024**3)
+            if would_exceed:
+                print(f"RAM image cache reached {cache_gb:.2f} GB before caching all images.", flush=True)
                 break
             self._maybe_cache_image(i, img)
             cached += 1
         if cached:
-            print(f"Cached {cached}/{len(self.im_files)} {self.split} images in RAM ({self.image_cache_bytes / (1024**3):.2f} GB).", flush=True)
+            with self.image_cache_lock:
+                cache_gb = self.image_cache_bytes / (1024**3)
+            print(f"Cached {cached}/{len(self.im_files)} {self.split} images in RAM ({cache_gb:.2f} GB).", flush=True)
 
     def image_cache_stats(self) -> dict[str, float]:
-        return {
-            "image_cache_hits": float(self.image_cache_hits),
-            "image_cache_misses": float(self.image_cache_misses),
-            "image_cache_items": float(len(self.image_cache)),
-            "image_cache_mb": float(self.image_cache_bytes / (1024**2)),
-        }
+        with self.image_cache_lock:
+            return {
+                "image_cache_hits": float(self.image_cache_hits),
+                "image_cache_misses": float(self.image_cache_misses),
+                "image_cache_items": float(len(self.image_cache)),
+                "image_cache_mb": float(self.image_cache_bytes / (1024**2)),
+            }
 
     def _load_or_build_cache(self):
         cache_file = self._cache_file()
@@ -739,18 +754,34 @@ class YOLODataset:
         for bi in range(len(self)):
             yield self[bi]
 
+    def _transform_index(self, idx: int, rect_shape: tuple[int, int] | None):
+        labels = self.get_image_and_label(int(idx))
+        if rect_shape is not None:
+            labels["rect_shape"] = rect_shape
+        return self.transforms(labels)
+
     def __getitem__(self, bi: int):
         batch_ids = self.indices[bi * self.batch : (bi + 1) * self.batch]
         if self.drop_last and len(batch_ids) < self.batch:
             raise IndexError(bi)
         rect_shape = tuple(self.batch_shapes[bi]) if self.batch_shapes is not None and bi < len(self.batch_shapes) else None
-        samples = []
-        for i in batch_ids:
-            labels = self.get_image_and_label(i)
-            if rect_shape is not None:
-                labels["rect_shape"] = rect_shape
-            samples.append(self.transforms(labels))
+        if self._sample_executor is not None and len(batch_ids) > 1:
+            samples = list(self._sample_executor.map(lambda i: self._transform_index(i, rect_shape), batch_ids))
+        else:
+            samples = [self._transform_index(i, rect_shape) for i in batch_ids]
         return self._collate_for_trainer(samples)
+
+    def close(self):
+        executor = self._sample_executor
+        self._sample_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def __del__(self):  # pragma: no cover - defensive cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:

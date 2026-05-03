@@ -56,6 +56,7 @@ class TrainConfig:
     rebuild_tfrecord: bool = False
     rect: bool = False
     workers: int = 8
+    sample_workers: int = 0
     gpus: str | None = None
     require_gpu: bool = False
     classes: list[int] | None = None
@@ -209,6 +210,7 @@ class YOLO26Trainer:
             f"compile_train_step={self.cfg.compile_train_step}, amp={self.cfg.amp}, "
             f"mixed_precision_policy={tf.keras.mixed_precision.global_policy().name}, "
             f"fast_data={self.cfg.fast_data}, prefetch_data={self.cfg.prefetch_data}, "
+            f"sample_workers={self.cfg.sample_workers}, "
             f"use_tfrecord={self.cfg.use_tfrecord}, "
             f"cache_images={self.cfg.cache_images}, fast_nms={self.cfg.fast_nms}, "
             f"profile_speed={self.cfg.profile_speed}, profile_stage={self.cfg.profile_stage}, "
@@ -244,17 +246,23 @@ class YOLO26Trainer:
             drop_last=self.replicas > 1,
             classes=self.cfg.classes,
             single_cls=self.cfg.single_cls,
+            sample_workers=self._effective_sample_workers(),
         )
         use_fast_data = bool(self.cfg.fast_data and not train_ds.rect)
         use_prefetch_data = bool(self.cfg.prefetch_data and not use_fast_data)
         data_path = (
             "tf_data_fast"
             if use_fast_data
-            else ("tf_data_distributed" if self.replicas > 1 else ("tf_data_prefetch" if use_prefetch_data else "python_iterator"))
+            else (
+                "tf_data_distributed"
+                if self.replicas > 1
+                else ("tf_data_prefetch_threaded" if use_prefetch_data and train_ds.sample_workers > 1 else ("tf_data_prefetch" if use_prefetch_data else "python_iterator"))
+            )
         )
         self.data_path = data_path
         print(
             f"training data: data_path={data_path}, workers={self.cfg.workers}, "
+            f"sample_workers={train_ds.sample_workers}, "
             f"batch={self.cfg.batch}, batches={len(train_ds)}, images={len(train_ds.im_files)}, "
             f"rect={train_ds.rect}, drop_last={train_ds.drop_last}",
             flush=True,
@@ -377,6 +385,7 @@ class YOLO26Trainer:
                             "dfl_loss": float(loss_items[2]),
                             "optimizer": self.optimizer_name,
                             "data_path": self.data_path,
+                            "sample_workers": float(train_ds.sample_workers),
                             **train_ds.image_cache_stats(),
                         }
                     )
@@ -451,9 +460,19 @@ class YOLO26Trainer:
             if profile_stop:
                 print(f"profiling stop: reached profile_batches={profile_limit}", flush=True)
                 break
+        train_ds.close()
         self._print_stage_profile_summary()
         final_metrics = self._final_eval() if (not profile_stop) and self.cfg.val and self.best.exists() and self.data.get("val") else {}
         return {"save_dir": str(self.save_dir), "best": str(self.best), "last": str(self.last), "history": self.history, "final_metrics": final_metrics}
+
+    def _effective_sample_workers(self) -> int:
+        if int(self.cfg.batch or 0) <= 1:
+            return 0
+        if int(self.cfg.sample_workers or 0) > 0:
+            return int(self.cfg.sample_workers)
+        if self.cfg.prefetch_data and not self.cfg.fast_data:
+            return max(int(self.cfg.workers or 0), 0)
+        return 0
 
     def _train_step(self, batch_tf: dict, accumulate: int, lr: float):
         if self.cfg.compile_train_step and not self._compiled_train_step_failed:
@@ -864,6 +883,7 @@ class YOLO26Trainer:
         print(
             "stage profile context: "
             f"optimizer={last.get('optimizer', self.optimizer_name)}, data_path={last.get('data_path', self.data_path)}, "
+            f"sample_workers={int(float(last.get('sample_workers', 0)))}, "
             f"image_cache_hits={int(float(last.get('image_cache_hits', 0)))}, "
             f"image_cache_misses={int(float(last.get('image_cache_misses', 0)))}, "
             f"image_cache_items={int(float(last.get('image_cache_items', 0)))}, "
@@ -948,6 +968,7 @@ def stage_profile_fields() -> list[str]:
         "dfl_loss",
         "optimizer",
         "data_path",
+        "sample_workers",
         "image_cache_hits",
         "image_cache_misses",
         "image_cache_items",

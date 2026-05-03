@@ -49,6 +49,7 @@ GPU_MONITOR_INTERVAL="${YOLO26_COCO_GPU_MONITOR_INTERVAL:-5}"
 OPTIMIZER="${YOLO26_COCO_OPTIMIZER:-sgd}"
 EMA_UPDATE_INTERVAL="${YOLO26_COCO_EMA_UPDATE_INTERVAL:-10}"
 GRAPH_OPTIMIZER_APPLY="${YOLO26_COCO_GRAPH_OPTIMIZER_APPLY:-1}"
+SAMPLE_WORKERS="${YOLO26_COCO_SAMPLE_WORKERS:-8}"
 
 mkdir -p "$OUT_DIR"
 LOG_FILE="${YOLO26_COCO_LOG:-$OUT_DIR/train_coco_yolo26n.log}"
@@ -179,6 +180,7 @@ required = {
     "sync_profile_stage": False,
     "ema_update_interval": 1,
     "graph_optimizer_apply": True,
+    "sample_workers": 0,
 }
 missing = [name for name in required if not hasattr(cfg, name)]
 wrong = [f"{name}={getattr(cfg, name)!r}" for name, expected in required.items() if hasattr(cfg, name) and getattr(cfg, name) != expected]
@@ -191,6 +193,7 @@ print(
     f"compile_train_step={cfg.compile_train_step}",
     f"amp={cfg.amp}",
     f"graph_optimizer_apply={cfg.graph_optimizer_apply}",
+    f"sample_workers={cfg.sample_workers}",
 )
 try:
     pkg_path.relative_to(root)
@@ -294,6 +297,7 @@ python -m yolo26_tf.cli detect train \
   --warmup-epochs "${YOLO26_COCO_WARMUP_EPOCHS:-3.0}" \
   --close-mosaic "${YOLO26_COCO_CLOSE_MOSAIC:-10}" \
   --workers "${YOLO26_COCO_WORKERS:-8}" \
+  --sample-workers "$SAMPLE_WORKERS" \
   --cache \
   --cache-images "$CACHE_IMAGES" \
   --cache-ram-gb "$CACHE_RAM_GB" \

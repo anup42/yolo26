@@ -30,6 +30,7 @@ def add_train_args(parser):
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--sample-workers", type=int, default=0, help="Per-batch CPU sample/augmentation workers. 0 derives from --workers when prefetch-data is enabled.")
     parser.add_argument("--gpus")
     parser.add_argument("--cache", action="store_true")
     parser.add_argument("--cache-images", default="auto", choices=("auto", "ram", "off"))
@@ -194,6 +195,7 @@ def main(argv=None):
             fraction=args.fraction,
             seed=args.seed,
             workers=args.workers,
+            sample_workers=args.sample_workers,
             gpus=args.gpus,
             cache=args.cache,
             cache_images=args.cache_images,
